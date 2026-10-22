@@ -1,0 +1,89 @@
+{
+  "name": "Product assistant",
+  "description": "Routes each message: product questions are rewritten into a search query, searched and answered; order questions get a fixed reply; small talk gets a short friendly answer.",
+  "dsl": {
+    "nodes": {
+      "begin": {"type": "begin", "next": "classify"},
+
+      "classify": {
+        "type": "categorize",
+        "params": {
+          "input": "{sys.query}",
+          "history": 4,
+          "categories": [
+            {
+              "name": "product_question",
+              "description": "Questions about products: features, prices, comparisons, recommendations, availability",
+              "examples": ["Which phone has the best camera?", "Do you have waterproof shoes?", "Is it cheaper than the other one?"],
+              "next": "rewrite"
+            },
+            {
+              "name": "order_status",
+              "description": "Questions about an existing order, delivery, payment or a refund",
+              "examples": ["Where is my order?", "I want a refund"],
+              "next": "order_reply"
+            },
+            {
+              "name": "smalltalk",
+              "description": "Greetings, thanks and anything else",
+              "examples": ["Hello", "Thanks!"],
+              "next": "chat"
+            }
+          ]
+        }
+      },
+
+      "rewrite": {
+        "type": "llm",
+        "params": {
+          "system_prompt": "Rewrite the user's last message as a short, standalone search query for a product catalog. Use the conversation to resolve words like \"it\" or \"the cheaper one\". Reply with the query only.",
+          "prompt": "{sys.query}",
+          "history": 6
+        },
+        "next": "search"
+      },
+      "search": {
+        "type": "retrieval",
+        "params": {"kb_ids": [1], "query": "{rewrite@content}", "top_k": 6},
+        "next": "check"
+      },
+      "check": {
+        "type": "switch",
+        "params": {
+          "cases": [{"conditions": [{"var": "{search@count}", "op": "==", "value": 0}], "next": "not_found"}],
+          "default": "answer"
+        }
+      },
+      "answer": {
+        "type": "llm",
+        "params": {
+          "system_prompt": "You are a sales assistant for our online shop. Answer using only the products below; never invent products, prices or features. Cite the numbers of the products you mention, like [1]. If none of them fits, say so and suggest what the user could ask instead. Answer in the user's language.\n\n# Products\n{search@formalized_content}",
+          "prompt": "{sys.query}",
+          "history": 6
+        },
+        "next": "reply"
+      },
+      "reply": {"type": "message", "params": {"text": "{answer@content}"}},
+      "not_found": {
+        "type": "message",
+        "params": {"text": "Sorry, I couldn't find a matching product. Could you describe what you're looking for in another way?"}
+      },
+
+      "order_reply": {
+        "type": "message",
+        "params": {"text": "I can't look up orders yet. Please contact our support team at support@example.com and they'll help you right away."}
+      },
+
+      "chat": {
+        "type": "llm",
+        "params": {
+          "system_prompt": "You are a friendly assistant for an online shop. Reply briefly and warmly, and offer to help the user find a product. Answer in the user's language.",
+          "prompt": "{sys.query}",
+          "history": 4
+        },
+        "next": "chat_reply"
+      },
+      "chat_reply": {"type": "message", "params": {"text": "{chat@content}"}}
+    }
+  }
+}

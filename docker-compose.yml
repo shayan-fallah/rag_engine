@@ -1,0 +1,59 @@
+name: rag-engine
+
+services:
+  postgres:
+    # Postgres 18 with pgvector, pgvectorscale and pg_textsearch (preloaded)
+    image: timescale/timescaledb-ha:pg18
+    environment:
+      POSTGRES_DB: rag
+      POSTGRES_PASSWORD: password
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/home/postgres/pgdata   # this image keeps its data here
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "rag"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/rag
+    command: sh -c "python manage.py migrate && exec gunicorn config.wsgi:application -k gthread --workers 2 --threads 16 --timeout 300 -b 0.0.0.0:8000"
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    extra_hosts: ["host.docker.internal:host-gateway"]  # to reach a MySQL running on the host
+    restart: unless-stopped
+
+  worker:
+    # Runs data source syncs (queued by the API, or on each source's schedule)
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/rag
+    command: python manage.py worker
+    depends_on:
+      postgres: {condition: service_healthy}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    restart: unless-stopped
+
+  # Optional: a MySQL with a sample products table, to try a data source.
+  #   docker compose --profile demo up -d
+  #   source URL: mysql://shop:shop@mysql-demo:3306/shop
+  mysql-demo:
+    image: mysql:8.4
+    profiles: ["demo"]
+    environment:
+      MYSQL_DATABASE: shop
+      MYSQL_USER: shop
+      MYSQL_PASSWORD: shop
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - ./examples/products_mysql.sql:/docker-entrypoint-initdb.d/products.sql:ro
+    ports: ["3307:3306"]
+
+volumes:
+  pgdata:

@@ -1,0 +1,12 @@
+django>=5.2,<6
+django-ninja>=1.4          # typed JSON API + Swagger docs at /api/docs
+psycopg[binary]>=3.2       # Postgres driver (Django uses it too)
+pgvector>=0.4              # vector column for Django
+openai>=1.100              # embeddings + any OpenAI-compatible chat model (OpenAI, LiteLLM, vLLM, Ollama)
+anthropic>=1.0             # Claude
+langgraph>=1.0             # runs the workflows
+pymysql>=1.1               # reads your MySQL product table (a data source, not used for storage)
+pydantic>=2.8
+python-dotenv>=1.0
+gunicorn>=23
+whitenoise>=6.7           # serves the admin's static files under gunicorn

@@ -1,0 +1,24 @@
+{
+  "name": "RAG chat",
+  "description": "Search the knowledge base with the user's message and answer from what was found.",
+  "dsl": {
+    "nodes": {
+      "begin": {"type": "begin", "next": "search"},
+      "search": {
+        "type": "retrieval",
+        "params": {"kb_ids": [1], "query": "{sys.query}", "top_k": 6},
+        "next": "answer"
+      },
+      "answer": {
+        "type": "llm",
+        "params": {
+          "system_prompt": "You are a helpful assistant for our online shop. Answer the user's question using only the information below. If it doesn't contain the answer, say you don't know instead of guessing. Cite the numbers of the items you used, like [1] or [2]. Answer in the user's language.\n\n# Information\n{search@formalized_content}",
+          "prompt": "{sys.query}",
+          "history": 6
+        },
+        "next": "reply"
+      },
+      "reply": {"type": "message", "params": {"text": "{answer@content}"}}
+    }
+  }
+}
