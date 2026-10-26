@@ -297,3 +297,298 @@ def test_empty_messages_are_left_out_of_history(kb, embeddings, use_llm):
     history = [{"role": "user", "content": "one"}, {"role": "assistant", "content": ""}]
     run(wf, "two", history=history)
     assert llm.calls[0]["messages"] == [{"role": "user", "content": "one"}, {"role": "user", "content": "two"}]
+
+
+# --- Settings that used to be internal ----------------------------------------------
+
+
+def test_categorize_system_prompt_is_a_setting(kb, use_llm):
+    llm = use_llm(ScriptedLLM(choose=lambda s, m: "a"))
+    dsl = {
+        "nodes": {
+            "begin": {"type": "begin", "next": "pick"},
+            "pick": {
+                "type": "categorize",
+                "params": {
+                    "system_prompt": "Choose for user {sys.user_id}:\n{categories}",
+                    "categories": [
+                        {"name": "a", "description": "first", "examples": ["x"], "next": "out"},
+                        {"name": "b"},
+                    ],
+                },
+            },
+            "out": {"type": "message", "params": {"text": "{pick@category}"}},
+        }
+    }
+    _, done = run(make_workflow(dsl), "q")
+    assert done["answer"] == "a"
+    assert llm.calls[0]["system"] == "Choose for user u1:\n- a: first\n    example: x\n- b"
+
+
+def test_retrieval_result_format(products, use_llm):
+    use_llm(ScriptedLLM())
+    dsl = {
+        "nodes": {
+            "begin": {"type": "begin", "next": "search"},
+            "search": {
+                "type": "retrieval",
+                "params": {"kb_ids": [products.id], "top_k": 1, "chunk_template": "#{ref} {title}: {metadata.price}"},
+                "next": "out",
+            },
+            "out": {"type": "message", "params": {"text": "{search@formalized_content}"}},
+        }
+    }
+    _, done = run(make_workflow(dsl), "noise cancelling headphones")
+    assert done["answer"] == "#1 QuietComfort headphones: 349"
+
+
+def test_agent_tool_texts_are_settings(products, use_llm):
+    class Capture(ScriptedLLM):
+        def run_tools(self, system, messages, tools, max_rounds=5, on_text=None):
+            self.tools = tools
+            return super().run_tools(system, messages, tools, max_rounds, on_text)
+
+    llm = use_llm(Capture(tool_plan=lambda s, m: [("find", {"query": "zebra xylophone"})]))
+    tool = {
+        "name": "find",
+        "description": "Find products",
+        "kb_ids": [products.id],
+        "max_distance": 0.01,
+        "query_description": "Product words in English",
+        "empty_response": "Nothing matched; try other words.",
+    }
+    dsl = {
+        "nodes": {
+            "begin": {"type": "begin", "next": "agent"},
+            "agent": {"type": "agent", "params": {"tools": [tool], "max_tokens": 900}},
+        }
+    }
+    run(make_workflow(dsl), "q")
+    assert llm.tools[0].parameters["properties"]["query"]["description"] == "Product words in English"
+    assert llm.calls[-1]["messages"][-1]["content"] == "Nothing matched; try other words."
+
+
+def test_layout_is_part_of_the_workflow(kb):
+    dsl = template("rag_chat", kb.id)
+    dsl["layout"] = {"begin": {"x": 0, "y": 0}, "search": {"x": 300, "y": 10.5}}
+    validate_dsl(dsl)
+    dsl["layout"]["search"] = {"x": "left"}
+    with pytest.raises(ValueError, match="layout"):
+        validate_dsl(dsl)
+
+
+def test_errors_name_their_node(kb):
+    from workflows.dsl import DSLError
+
+    dsl = template("rag_chat", kb.id)
+    dsl["nodes"]["search"]["params"]["top_k"] = 0
+    dsl["nodes"]["answer"]["params"]["prompt"] = "{nope@content}"
+    dsl["nodes"]["reply"]["colour"] = "red"
+    with pytest.raises(DSLError) as exc:
+        validate_dsl(dsl)
+    assert {node for node, _ in exc.value.errors} == {"reply"}  # the shape is checked first
+    del dsl["nodes"]["reply"]["colour"]
+    with pytest.raises(DSLError) as exc:
+        validate_dsl(dsl)
+    assert sorted(node for node, _ in exc.value.errors) == ["answer", "search"]
+
+
+# --- Metadata search --------------------------------------------------------------
+
+
+@pytest.fixture
+def catalog(transactional_db, embeddings):
+    from tests.test_knowledge import CATALOG
+
+    kb = KnowledgeBase.objects.create(name="catalog")
+    ingest_documents(kb, [DocInput(pid, text, title, meta) for pid, title, text, meta in CATALOG])
+    return kb
+
+
+def test_retrieval_by_metadata_only(catalog, use_llm):
+    use_llm(ScriptedLLM())
+    latest = {
+        "kb_ids": [catalog.id],
+        "mode": "metadata",
+        "sort_by": "date_added",
+        "top_k": 2,
+        "filters": [{"field": "category", "op": "==", "value": "{begin@category}"}],
+        "chunk_template": "{title}",
+    }
+    dsl = {
+        "nodes": {
+            "begin": {"type": "begin", "params": {"inputs": {"category": ""}}, "next": "latest"},
+            "latest": {"type": "retrieval", "params": latest, "next": "out"},
+            "out": {"type": "message", "params": {"text": "{latest@formalized_content}"}},
+        }
+    }
+    wf = make_workflow(dsl)
+    _, done = run(wf, "what's new?")
+    assert done["answer"] == "QuietComfort headphones\n\nPixel 9 phone"  # empty variable: the filter is skipped
+    assert done["references"][0]["score"] is None
+    _, done = run(wf, "what's new?", inputs={"category": "phones"})
+    assert done["answer"] == "Pixel 9 phone\n\nGalaxy S24 phone"
+
+    from workflows.engine import run_draft
+
+    events = list(run_draft(dsl, "what's new?"))
+    latest_log = next(e for e in events if e["event"] == "node_finished" and e["node"] == "latest")["inputs"]
+    assert latest_log["skipped_filters"] == ["category == {begin@category}"] and latest_log["filters"] == []
+
+
+def test_old_metadata_filter_still_works(products, use_llm):
+    use_llm(ScriptedLLM())
+    dsl = template("rag_chat", products.id)
+    dsl["nodes"]["search"]["params"]["metadata_filter"] = {"category": "audio"}
+    events, _ = run(make_workflow(dsl), "phone")
+    assert [r["external_id"] for r in _["references"]] == ["p3"]
+
+
+class ToolRunner(ScriptedLLM):
+    """Runs the planned tool calls like the real models do: errors come back to the model as text."""
+
+    def run_tools(self, system, messages, tools, max_rounds=5, on_text=None):
+        from core.llm import _call_tool
+
+        self.tools = tools
+        by_name = {t.name: t for t in tools}
+        self.results = [_call_tool(by_name, name, args) for name, args in self.tool_plan(system, messages)]
+        return "done"
+
+
+def test_agent_chooses_metadata_or_query_search(catalog, use_llm):
+    llm = use_llm(
+        ToolRunner(
+            tool_plan=lambda s, m: [
+                ("products", {"sort_by": "date_added"}),  # "the newest product": metadata only
+                ("products", {"query": "smartphone", "sort_by": "date_added", "order": "desc"}),  # the newest phones
+                (
+                    "products",
+                    {"filters": [{"field": "price", "op": "<", "value": 500}], "sort_by": "price", "order": "asc"},
+                ),
+                ("products", {"filters": [{"field": "colour", "op": "==", "value": "red"}]}),
+                ("products", {"query": "x", "order": "newest"}),
+            ]
+        )
+    )
+    tool = {
+        "name": "products",
+        "description": "Our products",
+        "kb_ids": [catalog.id],
+        "top_k": 2,
+        "sort_pool": 3,
+        "chunk_template": "{title}",
+        "filters": [{"field": "category", "op": "!=", "value": "Shoes"}],  # always applied
+        "metadata_fields": [
+            {"name": "date_added", "type": "date", "description": "When it was added"},
+            {"name": "price", "type": "number"},
+        ],
+    }
+    dsl = {
+        "nodes": {
+            "begin": {"type": "begin", "next": "agent"},
+            "agent": {"type": "agent", "params": {"tools": [tool]}},
+        }
+    }
+    events, _ = run(make_workflow(dsl), "q")
+
+    spec = llm.tools[0]
+    assert spec.parameters["required"] == [] and spec.parameters["properties"]["sort_by"]["enum"] == [
+        "date_added",
+        "price",
+    ]
+    assert spec.description.startswith("Our products\n\nYou can also filter and sort by these metadata fields:\n")
+    assert "- date_added (date): When it was added\n- price (number)\n" in spec.description
+    assert "Today is 20" in spec.description  # {sys.date} is filled in
+
+    newest, newest_phones, cheapest, unknown, bad_order = llm.results
+    assert newest == "QuietComfort headphones\n\nPixel 9 phone"
+    assert newest_phones == "Pixel 9 phone\n\nGalaxy S24 phone"  # the 3 best matches, newest first
+    assert cheapest == "Redmi Note phone\n\nQuietComfort headphones"
+    assert unknown == "Error: unknown field 'colour'; use one of: date_added, price"
+    assert bad_order == 'Error: order must be "desc" or "asc"'
+
+    calls = [e for e in events if e["event"] == "tool_call"]
+    assert calls[0]["query"] == "" and calls[0]["arguments"] == {"sort_by": "date_added"} and calls[0]["results"] == 2
+    assert "result" not in calls[0]  # tool results only in debug runs
+    assert calls[3]["error"].startswith("unknown field")
+
+
+def test_tool_without_fields_needs_a_query(products, use_llm):
+    llm = use_llm(ToolRunner(tool_plan=lambda s, m: [("find", {"query": " "})]))
+    tool = {"name": "find", "description": "Find products", "kb_ids": [products.id]}
+    dsl = {"nodes": {"begin": {"type": "begin", "next": "a"}, "a": {"type": "agent", "params": {"tools": [tool]}}}}
+    run(make_workflow(dsl), "q")
+    assert llm.tools[0].parameters["required"] == ["query"] and list(llm.tools[0].parameters["properties"]) == ["query"]
+    assert llm.results == ["Error: query is required"]
+
+
+def test_filter_settings_are_checked(kb):
+    dsl = template("rag_chat", kb.id)
+    params = dsl["nodes"]["search"]["params"]
+    params["filters"] = [{"field": "price", "op": ">", "value": True}, {"field": "brand", "op": "=="}]
+    with pytest.raises(ValueError) as exc:
+        validate_dsl(dsl)
+    assert "filters.0: true/false only works with == and !=" in str(exc.value)
+    assert "filters.1: enter a value" in str(exc.value)
+    params["filters"] = [{"field": "brand", "op": "in", "value": "{ghost@brands}"}]
+    with pytest.raises(ValueError, match="refers to a node that does not exist"):
+        validate_dsl(dsl)
+
+
+# --- Run log (debug runs) -----------------------------------------------------------
+
+
+def test_debug_run_logs_inputs_and_full_outputs(products, use_llm):
+    from workflows.engine import run_draft
+
+    use_llm(ScriptedLLM(reply=lambda s, m: "x" * 400))
+    dsl = template("rag_chat", products.id)
+    dsl["nodes"]["answer"]["params"]["system_prompt"] = "Use:\n{search@formalized_content}"
+    dsl["nodes"]["search"]["next"] = "check"
+    dsl["nodes"]["check"] = {
+        "type": "switch",
+        "params": {"cases": [{"conditions": [{"var": "{search@count}", "op": ">", "value": 0}], "next": "answer"}]},
+    }
+    events = list(run_draft(dsl, "smartphone", user_id="t"))
+    finished = {e["node"]: e for e in events if e["event"] == "node_finished"}
+
+    assert finished["begin"]["inputs"]["sys"]["query"] == "smartphone" and finished["begin"]["next"] == "search"
+    search_log = finished["search"]
+    assert search_log["inputs"] == {
+        "mode": "search",
+        "query": "smartphone",
+        "kb_ids": [products.id],
+        "filters": [],
+        "top_k": 6,
+    }
+    assert len(search_log["outputs"]["chunks"]) == 4  # the full list
+    condition = finished["check"]["inputs"]["cases"][0]["conditions"][0]
+    assert condition == {"var": "{search@count}", "value": 4, "op": ">", "compared_to": 0, "result": True}
+    assert finished["check"]["next"] == "answer"
+    answer = finished["answer"]["inputs"]
+    assert answer["system_prompt"].startswith("Use:\n[1] ") and answer["model"] == {"model": "scripted"}
+    assert answer["messages"] == [{"role": "user", "content": "smartphone"}]
+    assert len(finished["answer"]["outputs"]["content"]) == 400  # not shortened
+
+    # Saved workflows run without the log: no inputs, shortened outputs.
+    events, _ = run(make_workflow(dsl), "smartphone")
+    finished = {e["node"]: e for e in events if e["event"] == "node_finished"}
+    assert "inputs" not in finished["answer"] and finished["search"]["outputs"]["chunks"] == "[4 items]"
+
+
+def test_failed_node_is_logged(products, use_llm):
+    from workflows.api import guarded
+    from workflows.engine import run_draft
+
+    class Down(ScriptedLLM):
+        def stream(self, system, messages):
+            raise RuntimeError("the model is down")
+
+    use_llm(Down())
+    events = list(guarded(run_draft(template("rag_chat", products.id), "phone"), "test"))
+    failed = [e for e in events if e["event"] == "node_failed"]
+    assert len(failed) == 1 and failed[0]["node"] == "answer"
+    assert failed[0]["error"] == "RuntimeError: the model is down"
+    assert "[1] " in failed[0]["inputs"]["system_prompt"]  # what it was about to send
+    assert events[-1] == {"event": "error", "message": "RuntimeError: the model is down"}

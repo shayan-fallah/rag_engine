@@ -1,4 +1,7 @@
+import re
+from collections import Counter
 from datetime import datetime
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from django.db import IntegrityError
@@ -10,7 +13,7 @@ from ninja.errors import HttpError
 from knowledge.ingest import DocInput, default_external_id, ingest_documents
 from knowledge.jobs import enqueue_sync
 from knowledge.models import DataSource, Document, KnowledgeBase, SyncJob
-from knowledge.search import search
+from knowledge.search import DATE_TEXT, FILTER_OPS, metadata_search, search
 
 router = Router()
 
@@ -144,18 +147,92 @@ def delete_document(request, kb_id: int, external_id: str):
 # --- Search ---------------------------------------------------------------------
 
 
+class FilterIn(Schema):
+    field: str = Field(..., min_length=1, max_length=100)
+    op: Literal[FILTER_OPS] = "=="
+    value: Any = None
+
+
 class SearchIn(Schema):
-    query: str
+    query: str = Field("", description="Empty: find by metadata alone (filters and sort_by), no embedding")
     kb_ids: list[int]
     top_k: int = Field(5, ge=1, le=50)
-    metadata_filter: dict | None = None
+    metadata_filter: dict | None = Field(None, description='Exact matches, e.g. {"brand": "Samsung"}')
+    filters: list[FilterIn] = Field(default_factory=list, description="Conditions that must all match")
+    sort_by: str | None = Field(None, max_length=100, description="A metadata field to sort by, e.g. date_added")
+    sort_order: Literal["desc", "asc"] = "desc"
+    sort_pool: int | None = Field(
+        None, ge=1, le=200, description="With a query and sort_by: how many best matches to sort (default: top_k)"
+    )
     max_distance: float | None = Field(None, ge=0, le=2)
 
 
 @router.post("/search")
 def search_chunks(request, data: SearchIn):
-    """Hybrid (vector + keyword) search, without an LLM. Use it to tune your data and settings."""
-    return {"results": search(data.query, data.kb_ids, data.top_k, data.metadata_filter, data.max_distance)}
+    """Hybrid (vector + keyword) search, or by metadata alone with an empty query. No LLM involved.
+
+    Use it to tune your data and settings. A filter is {"field", "op", "value"}; ops: == != > >= < <= contains in.
+    """
+    filters = [f.dict() for f in data.filters]
+    sort = {"sort_by": data.sort_by or None, "sort_order": data.sort_order}
+    if data.query.strip():
+        results = search(
+            data.query,
+            data.kb_ids,
+            data.top_k,
+            data.metadata_filter,
+            data.max_distance,
+            filters=filters,
+            sort_pool=data.sort_pool,
+            **sort,
+        )
+    else:
+        results = metadata_search(
+            data.kb_ids, data.top_k, filters=filters, metadata_filter=data.metadata_filter, **sort
+        )
+    return {"results": results}
+
+
+@router.get("/kbs/{kb_id}/metadata-fields")
+def metadata_fields(request, kb_id: int):
+    """The metadata fields of a knowledge base (from its latest 2000 documents), with a type and examples.
+
+    The studio offers them when you pick fields to filter and sort by.
+    """
+    kb = get_object_or_404(KnowledgeBase, pk=kb_id)
+    kinds: dict[str, Counter] = {}
+    examples: dict[str, list] = {}
+    for metadata in Document.objects.filter(kb=kb).order_by("-id").values_list("metadata", flat=True)[:2000]:
+        for name, value in (metadata or {}).items():
+            if value is None or value == "":
+                continue
+            kinds.setdefault(name, Counter())[field_type(value)] += 1
+            seen = examples.setdefault(name, [])
+            if len(seen) < 3 and value not in seen and not isinstance(value, (dict, list)):
+                seen.append(value if not isinstance(value, str) else value[:60])
+    return [
+        {
+            "name": name,
+            "type": kinds[name].most_common(1)[0][0],
+            "count": sum(kinds[name].values()),
+            "examples": examples[name],
+        }
+        for name in sorted(kinds)
+    ]
+
+
+def field_type(value) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, str) and DATE_TEXT.match(value):
+        return "date"
+    if isinstance(value, str) and re.fullmatch(r"\s*-?\d+(\.\d+)?\s*", value):
+        return "number"
+    return "text"
 
 
 # --- Data sources ---------------------------------------------------------------

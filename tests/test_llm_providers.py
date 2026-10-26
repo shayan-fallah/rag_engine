@@ -394,3 +394,17 @@ def test_anthropic_parse_stays_under_the_non_streaming_limit(anthropic_api, sett
     assert "system" not in anthropic_api.requests[0]["body"]
     "".join(get_llm("anthropic").stream("", [{"role": "user", "content": "x"}]))
     assert anthropic_api.requests[1]["body"]["max_tokens"] == 64000  # streaming keeps the full budget
+
+
+def test_max_tokens_per_node(openai_api, anthropic_api):
+    openai_api.script = [{"text": "ok"}]
+    list(get_llm("openai", max_tokens=300).stream("", [{"role": "user", "content": "x"}]))
+    assert openai_api.requests[0]["body"]["max_completion_tokens"] == 300
+    openai_api.script = [{"text": "ok"}]
+    list(get_llm("openai").stream("", [{"role": "user", "content": "x"}]))
+    assert "max_completion_tokens" not in openai_api.requests[1]["body"]  # the model's own limit
+
+    anthropic_api.script = [{"text": "ok"}, {"text": '{"category": "a"}'}]
+    "".join(get_llm("anthropic", max_tokens=500).stream("", [{"role": "user", "content": "x"}]))
+    get_llm("anthropic", max_tokens=500).parse("", [{"role": "user", "content": "x"}], Choice)
+    assert [r["body"]["max_tokens"] for r in anthropic_api.requests] == [500, 500]

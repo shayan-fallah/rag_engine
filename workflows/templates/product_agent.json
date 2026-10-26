@@ -1,13 +1,13 @@
 {
   "name": "Product agent",
-  "description": "The model decides when and what to search, and can search several times (e.g. once per product type) before answering.",
+  "description": "The model decides when and what to search: by meaning, by metadata (e.g. the newest products, or the cheapest phones) or both, and can search several times before answering.",
   "dsl": {
     "nodes": {
       "begin": {"type": "begin", "next": "agent"},
       "agent": {
         "type": "agent",
         "params": {
-          "system_prompt": "You are a sales assistant for our online shop. Use the search_products tool to find products before you recommend anything; search again with other words if the first results don't fit. Only mention products the tool returned, and cite their numbers like [1]. Answer in the user's language.",
+          "system_prompt": "You are a sales assistant for our online shop. Use the search_products tool to find products before you recommend anything; search again with other words or filters if the first results don't fit. For the newest, cheapest or most expensive products, sort by the matching field. Only mention products the tool returned, and cite their numbers like [1]. Answer in the user's language.",
           "prompt": "{sys.query}",
           "history": 6,
           "max_rounds": 4,
@@ -16,7 +16,13 @@
               "name": "search_products",
               "description": "Search the product catalog. Returns numbered products with their descriptions, category and price.",
               "kb_ids": [1],
-              "top_k": 5
+              "top_k": 5,
+              "metadata_fields": [
+                {"name": "category", "description": "Product category: Phones, Audio, Shoes or Laptops"},
+                {"name": "brand", "description": "The brand, e.g. Samsung"},
+                {"name": "price", "type": "number", "description": "Price in USD"},
+                {"name": "date_added", "type": "date", "description": "When the product was added to the shop"}
+              ]
             }
           ]
         },

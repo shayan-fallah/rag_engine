@@ -53,6 +53,7 @@ INSTALLED_APPS = [
     "django.contrib.postgres",
     "knowledge",
     "workflows",
+    "studio",
 ]
 
 MIDDLEWARE = [
@@ -92,6 +93,8 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+# Serve static files (admin, studio) from the apps too, so they work without collectstatic.
+WHITENOISE_USE_FINDERS = True
 USE_TZ = True
 TIME_ZONE = "UTC"
 

@@ -5,16 +5,20 @@ nodes become conditional edges. The run state is:
 
     sys         {query, user_id, conversation_id, date, history, turns}
     inputs      values for the begin node, from the request
+    debug       true: events carry each node's inputs and full outputs (the studio's run log)
     outputs     {node_id: {output: value}}        (merged as nodes finish)
     answer      [text shown to the user]           (appended)
     references  [chunks the answer is based on]    (appended)
 
 run_workflow() yields events as dicts:
     node_started   {node, type}
-    node_finished  {node, type, elapsed_ms, outputs}
-    tool_call      {node, tool, query, results}    (agent nodes)
+    node_finished  {node, type, elapsed_ms, outputs, next}     (+ inputs when debug)
+    node_failed    {node, type, elapsed_ms, error}             (+ inputs when debug)
+    tool_call      {node, tool, arguments, query, results, elapsed_ms, error?}   (agent nodes; + result when debug)
     message        {delta}                         (answer text, as it is written)
     done           {answer, references}           (references[].cited: the answer cites it as [n])
+
+Without debug, long outputs are shortened (lists of results become "[n items]").
 """
 
 import operator
@@ -37,6 +41,7 @@ def merge(old: dict, new: dict) -> dict:
 class RunState(TypedDict):
     sys: dict
     inputs: dict
+    debug: bool
     outputs: Annotated[dict, merge]
     answer: Annotated[list[str], operator.add]
     references: Annotated[list[dict], operator.add]
@@ -110,6 +115,30 @@ def run_workflow(
     inputs: dict | None = None,
 ) -> Iterator[dict]:
     spec, graph = get_graph(workflow)
+    yield from run_graph(spec, graph, query, user_id, conversation_id, history, inputs)
+
+
+def run_draft(
+    dsl: dict, query: str, user_id: str = "", history: list[dict] | None = None, inputs: dict | None = None
+) -> Iterator[dict]:
+    """Run a workflow that isn't saved (the studio's test panel), with debug events.
+
+    An invalid workflow raises DSLError right away.
+    """
+    spec = validate_dsl(dsl)
+    return run_graph(spec, build_graph(spec), query, user_id, "", history, inputs, debug=True)
+
+
+def run_graph(
+    spec: WorkflowSpec,
+    graph,
+    query: str,
+    user_id: str = "",
+    conversation_id: str = "",
+    history: list[dict] | None = None,
+    inputs: dict | None = None,
+    debug: bool = False,
+) -> Iterator[dict]:
     history = history or []
     state = {
         "sys": {
@@ -121,6 +150,7 @@ def run_workflow(
             "turns": sum(1 for m in history if m["role"] == "user"),
         },
         "inputs": inputs or {},
+        "debug": debug,
         "outputs": {},
         "answer": [],
         "references": [],

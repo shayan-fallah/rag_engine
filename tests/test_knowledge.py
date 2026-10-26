@@ -4,7 +4,7 @@ from django.db import connection
 from knowledge.ingest import DocInput, ingest_documents
 from knowledge.jobs import claim_job, enqueue_sync, work
 from knowledge.models import Chunk, DataSource, Document, KnowledgeBase, SyncJob
-from knowledge.search import format_chunks, search
+from knowledge.search import as_reference, check_filters, format_chunks, metadata_search, search
 from knowledge.search_indexes import backends
 from knowledge.sources import SyncError, page_query, row_to_document, sync_source
 from tests.conftest import PRODUCTS
@@ -83,6 +83,113 @@ def test_max_distance_drops_unrelated_vector_matches(kb, embeddings):
     assert search("zebra xylophone", [kb.id], top_k=5, max_distance=0.5) == []
 
 
+CATALOG = [
+    # id, title, text, metadata (dates as a SQL source stores them: ISO text)
+    (
+        "a",
+        "Galaxy S24 phone",
+        "Samsung smartphone with a great camera.",
+        {"category": "Phones", "price": 799.0, "date_added": "2025-01-10T09:00:00", "tags": ["new"], "active": 1},
+    ),
+    (
+        "b",
+        "Pixel 9 phone",
+        "Google smartphone with a great camera.",
+        {"category": "Phones", "price": "699.00", "date_added": "2025-03-05T12:30:00", "active": 1},
+    ),
+    (
+        "c",
+        "Redmi Note phone",
+        "Budget smartphone with a big battery.",
+        {"category": "Phones", "price": 229, "date_added": "2024-11-20 08:00:00", "active": 0},
+    ),
+    (
+        "d",
+        "QuietComfort headphones",
+        "Bose noise cancelling headphones.",
+        {"category": "Audio", "price": 429, "date_added": "2025-03-20T18:00:00", "tags": ["sale", "New"]},
+    ),
+    ("e", "Trail shoes", "Running shoes for mountain trails.", {"category": "Shoes"}),
+]
+
+
+def add_catalog(kb):
+    return ingest_documents(kb, [DocInput(pid, text, title, meta) for pid, title, text, meta in CATALOG])
+
+
+def ids(results):
+    return [r["external_id"] for r in results]
+
+
+def test_metadata_search_sorts_and_filters_without_a_query(kb, embeddings):
+    add_catalog(kb)
+    embeddings.texts.clear()
+    newest = metadata_search([kb.id], top_k=2, sort_by="date_added")
+    assert ids(newest) == ["d", "b"] and not embeddings.texts  # no embedding call
+    assert newest[0]["score"] is None and newest[0]["content"].startswith("QuietComfort headphones")
+    assert as_reference(newest[0], 1)["score"] is None
+    assert ids(metadata_search([kb.id], top_k=10, sort_by="date_added", sort_order="asc")) == ["c", "a", "b", "d", "e"]
+
+    def find(*filters, **kwargs):
+        return ids(metadata_search([kb.id], top_k=10, filters=list(filters), **kwargs))
+
+    phones = {"field": "category", "op": "==", "value": "phones"}  # text ignores case
+    assert find(phones, sort_by="date_added") == ["b", "a", "c"]
+    assert find(phones, {"field": "price", "op": "<", "value": 700}, sort_by="price") == [
+        "b",
+        "c",
+    ]  # "699.00" is a number
+    assert find({"field": "price", "op": ">=", "value": "699"}, sort_by="price", sort_order="asc") == ["b", "a"]
+    assert find({"field": "date_added", "op": ">=", "value": "2025-03"}, sort_by="date_added") == [
+        "d",
+        "b",
+    ]  # the month
+    assert find({"field": "date_added", "op": "<=", "value": "2025-01-10"}, sort_by="date_added") == [
+        "a",
+        "c",
+    ]  # the day
+    assert find({"field": "date_added", "op": "==", "value": "2024-11-20T08:00"}) == ["c"]  # " " or "T"
+    assert find({"field": "category", "op": "in", "value": "Audio, shoes"}) == ["d", "e"]
+    assert find({"field": "price", "op": "in", "value": [229, 429]}) == ["c", "d"]
+    assert find({"field": "tags", "op": "contains", "value": "new"}) == ["a", "d"]  # a list item, any case
+    assert find({"field": "title", "op": "contains", "value": "x"}) == []  # title isn't metadata
+    assert find({"field": "category", "op": "contains", "value": "hon"}) == ["a", "b", "c"]
+    assert find({"field": "active", "op": "==", "value": True}) == ["a", "b"]  # 1 is true
+    assert find({"field": "active", "op": "!=", "value": True}) == ["c", "d", "e"]  # missing counts as "not equal"
+    assert find(phones, metadata_filter={"active": 0}) == ["c"]
+
+
+def test_search_with_filters_and_sort(kb, embeddings):
+    add_catalog(kb)
+    results = search("smartphone camera", [kb.id], top_k=5)
+    assert ids(results)[:2] in (["a", "b"], ["b", "a"])
+
+    # The newest of the best matches: the matches are sorted by the field.
+    newest = search("smartphone", [kb.id], top_k=2, sort_by="date_added", sort_pool=3)
+    assert ids(newest) == ["b", "a"] and newest[0]["score"] > 0
+
+    cheap = search("smartphone", [kb.id], top_k=5, filters=[{"field": "price", "op": "<", "value": 500}])
+    assert ids(cheap)[0] == "c" and set(ids(cheap)) == {"c", "d"}  # d (429) is no phone, but cheap
+
+
+def test_check_filters_explains_mistakes():
+    assert check_filters([{"field": " price ", "op": "in", "value": "1, 2"}]) == [
+        {"field": "price", "op": "in", "value": ["1", "2"]}
+    ]
+    for bad, message in [
+        ([{"op": "=="}], "field"),
+        ([{"field": "x", "op": "~"}], "op must be one of"),
+        ([{"field": "x", "op": "in", "value": []}], "list of values"),
+        ([{"field": "x", "op": ">", "value": True}], "true/false only"),
+        ([{"field": "x", "op": "==", "value": None}], "value must be"),
+        (["price < 3"], "filter 1: a filter must be an object"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            check_filters(bad)
+    with pytest.raises(ValueError, match="order must be"):
+        metadata_search([1], sort_by="x", sort_order="newest")
+
+
 def test_format_chunks_numbers_and_metadata():
     text = format_chunks([{"content": "Pixel 9\nA phone", "metadata": {"price": 699}}], start=3)
     assert text == "[3] Pixel 9\nA phone\n(price: 699)"
@@ -101,6 +208,8 @@ def test_fulltext_fallback_when_pg_textsearch_is_missing(kb, embeddings):
     assert results[0]["external_id"] == "p4" and results[0]["keyword_rank"] == 1
     results = search("camera", [kb.id], top_k=5, metadata_filter={"category": "phones"})
     assert {r["external_id"] for r in results} == {"p1", "p2"}
+    results = search("camera", [kb.id], top_k=5, filters=[{"field": "price", "op": ">", "value": 700}], sort_by="price")
+    assert [r["external_id"] for r in results] == ["p1"]
 
 
 # --- Data sources -----------------------------------------------------------------
@@ -271,3 +380,18 @@ def test_job_deleted_during_sync_does_not_crash_the_worker(products_table, embed
     monkeypatch.setattr("knowledge.jobs.sync_source", sync_then_delete)
     work(once=True)
     assert not SyncJob.objects.exists()
+
+
+def test_format_chunks_with_a_template():
+    chunks = [
+        {"content": "Pixel 9\nA phone", "title": "Pixel 9", "external_id": "p2", "metadata": {"price": 699}},
+        {"content": "FAQ text", "title": "FAQ", "external_id": "f1", "metadata": {}},
+    ]
+    template = "<{ref}> {title} ({external_id})\nPrice: {metadata.price}\n{content}"
+    assert format_chunks(chunks, start=1, template=template) == (
+        "<1> Pixel 9 (p2)\nPrice: 699\nPixel 9\nA phone\n\n<2> FAQ (f1)\nFAQ text"  # no price: line left out
+    )
+    # The default drops the "(metadata)" line when there is none.
+    assert format_chunks(chunks[1:], start=5) == "[5] FAQ text"
+    # A line with other placeholders is kept, even when its metadata is empty.
+    assert format_chunks(chunks[1:], template="[{ref}] {content} ({metadata.price})") == "[1] FAQ text ()"

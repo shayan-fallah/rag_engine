@@ -83,22 +83,26 @@ def get_llm(
     model: str | None = None,
     temperature: float | None = None,
     effort: str | None = None,
+    max_tokens: int | None = None,
 ) -> "LLM":
     provider = provider or settings.LLM_PROVIDER
     effort = effort or settings.LLM_EFFORT or None
     if provider == "openai":
-        return OpenAIChat(model or settings.OPENAI_MODEL, temperature, effort)
+        return OpenAIChat(model or settings.OPENAI_MODEL, temperature, effort, max_tokens)
     if provider == "anthropic":
-        return AnthropicChat(model or settings.ANTHROPIC_MODEL, temperature, effort)
+        return AnthropicChat(model or settings.ANTHROPIC_MODEL, temperature, effort, max_tokens)
     raise ValueError(f"Unknown LLM provider {provider!r}; use 'openai' or 'anthropic'")
 
 
 class LLM:
-    def __init__(self, model: str, temperature: float | None, effort: str | None):
+    provider = ""
+
+    def __init__(self, model: str, temperature: float | None, effort: str | None, max_tokens: int | None = None):
         self.model = model
         # Left unset by default: current reasoning models reject a custom temperature.
         self.temperature = temperature
         self.effort = effort
+        self.max_tokens = max_tokens  # None: LLM_MAX_TOKENS for Claude, the model's limit for OpenAI
 
     def stream(self, system: str, messages: list[dict]) -> Iterator[str]:
         """Yield the answer text as it is generated."""
@@ -128,6 +132,8 @@ class LLM:
 
 
 class OpenAIChat(LLM):
+    provider = "openai"
+
     def _params(self, system: str, messages: list[dict]) -> dict:
         params: dict[str, Any] = {
             "model": self.model,
@@ -137,6 +143,8 @@ class OpenAIChat(LLM):
             params["temperature"] = self.temperature
         if self.effort:
             params["reasoning_effort"] = self.effort
+        if self.max_tokens:
+            params["max_completion_tokens"] = self.max_tokens
         return params
 
     def stream(self, system, messages):
@@ -216,10 +224,12 @@ class OpenAIChat(LLM):
 
 
 class AnthropicChat(LLM):
+    provider = "anthropic"
+
     def _params(self, system: str, messages: list[dict], max_tokens: int | None = None) -> dict:
         params: dict[str, Any] = {
             "model": self.model,
-            "max_tokens": max_tokens or settings.LLM_MAX_TOKENS,
+            "max_tokens": max_tokens or self.max_tokens or settings.LLM_MAX_TOKENS,
             "messages": messages,
         }
         if system:
@@ -243,7 +253,7 @@ class AnthropicChat(LLM):
 
     def parse(self, system, messages, schema):
         # Not streamed, so keep max_tokens below the SDK's limit for non-streaming requests.
-        params = self._params(system, messages, max_tokens=min(settings.LLM_MAX_TOKENS, 16000))
+        params = self._params(system, messages, max_tokens=min(self.max_tokens or settings.LLM_MAX_TOKENS, 16000))
         response = _anthropic().beta.messages.parse(**params, output_format=schema)
         if response.stop_reason == "refusal" or response.parsed_output is None:
             raise LLMError(f"No structured output (stop_reason: {response.stop_reason})")
