@@ -14,6 +14,7 @@ from django.utils import timezone
 from ninja import Field, Router, Schema
 from ninja.errors import HttpError
 
+from core.models import LLMProfile
 from workflows.dsl import SYS_VAR_INFO, DSLError, node_types, validate_dsl
 from workflows.engine import run_draft, run_workflow
 from workflows.models import Conversation, Message, Workflow
@@ -66,6 +67,18 @@ def get_node_types(request):
             "max_tokens": settings.LLM_MAX_TOKENS,
         },
     }
+
+
+class LLMProfileOut(Schema):
+    name: str
+    kind: str
+    default_model: str
+
+
+@router.get("/llm-profiles", response=list[LLMProfileOut])
+def list_llm_profiles(request):
+    """The LLM profiles nodes can use ("profile": name). Set up in the admin; URLs and keys are never sent."""
+    return LLMProfile.objects.order_by("name")
 
 
 @router.get("/workflow-templates")

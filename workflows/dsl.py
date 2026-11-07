@@ -17,9 +17,10 @@ Node types and their outputs are listed in NODE_INFO below. Every param is
 described by its pydantic model; the studio editor builds its forms from them
 (node_types()), so a new param shows up there by itself. json_schema_extra
 hints how to show it: widget (prompt, template, kbs, node, kv, value, model,
-textarea, field: a metadata field name), group (model, metadata, advanced:
+profile, textarea, field: a metadata field name), group (model, metadata, advanced:
 collapsed sections), placeholders, variables (false: no variable picker), labels
-(for choices), fill_from_kbs and hide_when ({param: [values]} or {param: "empty"}).
+(for choices), fill_from_kbs, hide_when ({param: [values]}, {param: "empty"} or
+{param: "not_empty"}) and clears (params emptied when this one is set).
 
 "layout" (optional) holds node positions for the editor and is not used to run.
 """
@@ -95,13 +96,23 @@ class Params(BaseModel):
 
 
 class ModelOptions(Params):
+    profile: str | None = Field(
+        None,
+        max_length=100,
+        title="Profile",
+        description="A model server with its own URL and key, set up in the admin. Empty: the server's .env settings",
+        json_schema_extra=ui("profile", group="model", clears=["provider"]),
+    )
     provider: Literal["openai", "anthropic"] | None = Field(
-        None, title="Provider", description="Empty: LLM_PROVIDER of the server", json_schema_extra=ui(group="model")
+        None,
+        title="Provider",
+        description="Empty: LLM_PROVIDER of the server",
+        json_schema_extra=ui(group="model", hide_when={"profile": "not_empty"}),
     )
     model: str | None = Field(
         None,
         title="Model",
-        description="Empty: OPENAI_MODEL or ANTHROPIC_MODEL of the server",
+        description="Empty: the profile's default model, or OPENAI_MODEL / ANTHROPIC_MODEL of the server",
         json_schema_extra=ui("model", group="model"),
     )
     temperature: float | None = Field(
@@ -109,7 +120,7 @@ class ModelOptions(Params):
         ge=0,
         le=2,
         title="Temperature",
-        description="Empty: the model's default (reasoning models only accept their default)",
+        description="Empty: the model's default (reasoning models and current Claude models only accept their default)",
         json_schema_extra=ui(group="model"),
     )
     effort: Literal["low", "medium", "high"] | None = Field(
@@ -126,6 +137,17 @@ class ModelOptions(Params):
         "(sent to them as max_completion_tokens)",
         json_schema_extra=ui(group="model"),
     )
+
+    @field_validator("profile")
+    @classmethod
+    def no_blank_profile(cls, value):
+        return (value or "").strip() or None
+
+    @model_validator(mode="after")
+    def profile_or_provider(self):
+        if self.profile and self.provider:
+            raise ValueError("set a profile or a provider, not both (the profile's kind is its provider)")
+        return self
 
 
 FilterOp = Literal[FILTER_OPS]
@@ -604,8 +626,11 @@ class DSLError(ValueError):
         super().__init__("; ".join(f"{node}: {message}" if node else message for node, message in errors))
 
 
-def validate_dsl(dsl: dict, check_kbs: bool = True) -> WorkflowSpec:
-    """Parse and check a workflow. Raises DSLError (a ValueError) with readable messages."""
+def validate_dsl(dsl: dict, check_db: bool = True) -> WorkflowSpec:
+    """Parse and check a workflow. Raises DSLError (a ValueError) with readable messages.
+
+    check_db: also check that the knowledge bases and LLM profiles it uses exist.
+    """
     try:
         spec = WorkflowSpec.model_validate(dsl)
     except ValidationError as exc:
@@ -637,27 +662,48 @@ def validate_dsl(dsl: dict, check_kbs: bool = True) -> WorkflowSpec:
     if len(begins) != 1:
         errors.append((None, f"a workflow needs exactly one begin node (found {len(begins)})"))
 
-    if check_kbs and not errors:
-        from knowledge.models import KnowledgeBase
-
-        used: dict[int, list[str]] = {}
-        for node_id, node in spec.nodes.items():
-            if node.type == "retrieval":
-                ids = node.parsed.kb_ids
-            elif node.type == "agent":
-                ids = [i for t in node.parsed.tools for i in t.kb_ids]
-            else:
-                continue
-            for kb_id in ids:
-                used.setdefault(kb_id, []).append(node_id)
-        existing = set(KnowledgeBase.objects.filter(id__in=used).values_list("id", flat=True))
-        for kb_id in sorted(set(used) - existing):
-            for node_id in dict.fromkeys(used[kb_id]):
-                errors.append((node_id, f"knowledge base(s) [{kb_id}] do not exist"))
+    if check_db and not errors:
+        errors += _missing_kbs(spec) + _missing_profiles(spec)
 
     if errors:
         raise DSLError(errors)
     return spec
+
+
+def _missing_kbs(spec: WorkflowSpec) -> list[tuple[str, str]]:
+    from knowledge.models import KnowledgeBase
+
+    used: dict[int, list[str]] = {}
+    for node_id, node in spec.nodes.items():
+        if node.type == "retrieval":
+            ids = node.parsed.kb_ids
+        elif node.type == "agent":
+            ids = [i for t in node.parsed.tools for i in t.kb_ids]
+        else:
+            continue
+        for kb_id in ids:
+            used.setdefault(kb_id, []).append(node_id)
+    errors = []
+    existing = set(KnowledgeBase.objects.filter(id__in=used).values_list("id", flat=True))
+    for kb_id in sorted(set(used) - existing):
+        for node_id in dict.fromkeys(used[kb_id]):
+            errors.append((node_id, f"knowledge base(s) [{kb_id}] do not exist"))
+    return errors
+
+
+def _missing_profiles(spec: WorkflowSpec) -> list[tuple[str, str]]:
+    from core.models import LLMProfile
+
+    nodes = {i: n.parsed for i, n in spec.nodes.items() if getattr(n.parsed, "profile", None)}
+    profiles = {p.name: p for p in LLMProfile.objects.filter(name__in={p.profile for p in nodes.values()})}
+    errors = []
+    for node_id, params in nodes.items():
+        profile = profiles.get(params.profile)
+        if profile is None:
+            errors.append((node_id, f"profile: LLM profile {params.profile!r} does not exist; add it in the admin"))
+        elif not (params.model or profile.default_model):
+            errors.append((node_id, f"model: LLM profile {params.profile!r} has no default model; name a model here"))
+    return errors
 
 
 def _references(value) -> list[str]:

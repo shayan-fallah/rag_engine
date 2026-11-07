@@ -6,6 +6,7 @@ A small RAG engine with a workflow (agent) builder, in Django. **Postgres is the
 - **Hybrid search**: vector search (pgvectorscale DiskANN) + keyword search (pg_textsearch BM25), merged with Reciprocal Rank Fusion. Same approach and libraries as `pgvectorscale-rag-solution`: `psycopg` + `pgvector` + plain SQL, the `openai` and `anthropic` SDKs.
 - **Metadata search**: filter and sort by metadata (`price < 500`, `date_added >= 2025-01`, newest first), with or without a query. A retrieval node can be set to it, and an agent's search tool lets the model decide per call: metadata alone ("the newest product"), a query, or both ("the newest phone with a good camera").
 - **Workflows** like RAGFlow's agent canvas, run with **LangGraph**: begin, retrieval, llm, agent (with search tools), categorize, switch, message. Same `{sys.query}` / `{node@output}` variables.
+- **LLM profiles**: model servers (any OpenAI-compatible server, or Anthropic) with their own URL and key, set up in the admin, so each node can use its own: a local model for routing, a hosted one for the answer.
 - **Studio**: a visual editor for workflows at `/studio/`: drag nodes onto a canvas, connect them, edit every setting of every node (prompts, the internal prompts too, models, search settings) and test-run before saving, with a run log of every node's inputs and outputs.
 - **Conversations** per user of your app, with streamed answers (Server-Sent Events) and sources.
 
@@ -20,7 +21,7 @@ Not included (on purpose, for now): PDF/Word parsing, other chunking methods, re
          knowledge/                      workflows/                      core/
          sources.py  MySQL rows → docs   dsl.py     JSON → validated graph   llm.py         OpenAI-compatible / Claude
          ingest.py   docs → chunks →     engine.py  graph → LangGraph        embeddings.py  OpenAI-compatible
-                     embeddings          nodes.py   what each node does
+                     embeddings          nodes.py   what each node does      models.py      LLM profiles
          search.py   hybrid search
          jobs.py     sync queue (worker)
                  │                             │
@@ -211,12 +212,12 @@ Open **http://localhost:8000/studio/** and log in with a superuser (`python mana
 
 - **Workflows page**: create a workflow (blank, or from a template, picking the knowledge bases it searches), import/export JSON, duplicate, delete.
 - **Canvas**: drag a node type from the left onto the canvas, or click it to add it after the selected node. Connect nodes by dragging from the dot on the right of a node to another node; drop on empty space to add a connected node. Categorize and switch nodes have one dot per category/case (and `else`). Select a connection and press Delete to remove it. Wheel zooms, dragging the background pans, the buttons bottom-left fit the view and arrange the nodes.
-- **Settings panel**: every setting of the selected node, with help text: prompts (with a variable picker listing `{sys.*}` and the outputs of the nodes before it, and a large editor), knowledge bases, search settings and metadata filters (field names are suggested from the knowledge base), categories, switch cases and conditions, agent tools (with "Add from the knowledge bases" to list the metadata fields the model may use), begin inputs. **Model** (provider, model, temperature, reasoning effort, max output tokens) and **Advanced** sections hold the settings that used to be built in: the categorize system prompt, the format of search results given to the model, the text when nothing is found, how a tool's query is described to the model. Settings left at their default aren't stored, so the workflow JSON stays short; changed ones get a "Reset" link. Renaming a node updates every `{old@...}` reference.
+- **Settings panel**: every setting of the selected node, with help text: prompts (with a variable picker listing `{sys.*}` and the outputs of the nodes before it, and a large editor), knowledge bases, search settings and metadata filters (field names are suggested from the knowledge base), categories, switch cases and conditions, agent tools (with "Add from the knowledge bases" to list the metadata fields the model may use), begin inputs. **Model** (profile, provider, model, temperature, reasoning effort, max output tokens; the profile dropdown lists the LLM profiles from the admin) and **Advanced** sections hold the settings that used to be built in: the categorize system prompt, the format of search results given to the model, the text when nothing is found, how a tool's query is described to the model. Settings left at their default aren't stored, so the workflow JSON stays short; changed ones get a "Reset" link. Renaming a node updates every `{old@...}` reference.
 - **Checks as you edit**: problems are shown on the nodes and in the panel; a workflow with problems can't be saved.
 - **Test run** tab: chat with the workflow as it is in the editor, unsaved changes included. Nothing is stored. Nodes light up as they run, and the **run log** opens under the canvas: every node that ran, in order, with what went in (the final prompts and messages sent to the model, the model and its settings, the query, filters and sort a search used, the tools the agent was given, each switch condition and its result) and what came out (every output in full, the results with their metadata), the agent's searches (its arguments, whether it searched by query, metadata or both, and the exact text it got back), errors, and the time each step took. Click a step to open it and select its node; copy or download the log as JSON. Each answer also lists its references.
 - **Save** (Ctrl+S): apps using the workflow get the new version right away. If someone else saved it since you opened it, you are asked before overwriting. Undo/redo (Ctrl+Z / Ctrl+Shift+Z) covers every change, "Edit JSON" edits the raw workflow.
 
-It is plain JavaScript modules and CSS in `studio/static/` served by Django (no Node build, no CDN, works offline). It uses the same API as your apps, logged in with the Django session (superusers only; writes need the CSRF token), plus a few endpoints for editors: `GET /api/node-types` (every node type with the JSON schema of its params: the forms are generated from the pydantic models in `workflows/dsl.py`, so a new param shows up in the studio by itself), `GET /api/workflow-templates`, `POST /api/workflows/validate`, `POST /api/workflows/test-run` (streams the run with each node's inputs and full outputs) and `GET /api/kbs/{id}/metadata-fields`. Node positions are stored in the workflow as `"layout"` (ignored when running).
+It is plain JavaScript modules and CSS in `studio/static/` served by Django (no Node build, no CDN, works offline). It uses the same API as your apps, logged in with the Django session (superusers only; writes need the CSRF token), plus a few endpoints for editors: `GET /api/node-types` (every node type with the JSON schema of its params: the forms are generated from the pydantic models in `workflows/dsl.py`, so a new param shows up in the studio by itself), `GET /api/workflow-templates`, `POST /api/workflows/validate`, `POST /api/workflows/test-run` (streams the run with each node's inputs and full outputs), `GET /api/kbs/{id}/metadata-fields` and `GET /api/llm-profiles` (names, kinds and default models; never URLs or keys). Node positions are stored in the workflow as `"layout"` (ignored when running).
 
 ---
 
@@ -235,7 +236,7 @@ A workflow is JSON: nodes, each with a `type`, `params` and (except routing node
 }
 ```
 
-It is checked when you save it (unknown nodes, bad references, missing knowledge bases, wrong params all return a 400 with the reason).
+It is checked when you save it (unknown nodes, bad references, missing knowledge bases or LLM profiles, wrong params all return a 400 with the reason).
 
 **Variables** can be used in any text param:
 - `{sys.query}` the user's message, `{sys.user_id}`, `{sys.conversation_id}`, `{sys.date}`, `{sys.turns}`, `{sys.history}` (the conversation as text)
@@ -245,7 +246,7 @@ It is checked when you save it (unknown nodes, bad references, missing knowledge
 |---|---|---|
 | `begin` | `inputs`: names and default values, overridden by the request's `"inputs"` | each input |
 | `retrieval` | `kb_ids`, `mode` (`search`, or `metadata`: filters and sort only, no query), `query` (default `{sys.query}`), `filters` (`[{field, op, value}]`), `sort_by`, `sort_order` (`desc`), `top_k` (5), `sort_pool`, `max_distance`, `empty_response`, `chunk_template` | `formalized_content` (numbered results for a prompt), `chunks`, `count`, `query` |
-| `llm` | `system_prompt`, `prompt` (default `{sys.query}`), `history` (previous messages to include, 0), model options: `provider`, `model`, `temperature`, `effort`, `max_tokens` | `content` |
+| `llm` | `system_prompt`, `prompt` (default `{sys.query}`), `history` (previous messages to include, 0), model options: `profile`, `provider`, `model`, `temperature`, `effort`, `max_tokens` | `content` |
 | `agent` | like `llm`, plus `tools`: `[{name, description, kb_ids, top_k, metadata_fields, filters, max_distance, sort_pool, metadata_prompt, query_description, filters_description, sort_description, order_description, empty_response, chunk_template}]` and `max_rounds` (4) | `content` |
 | `categorize` | `input` (default `{sys.query}`), `history`, `categories`: `[{name, description, examples, next}]`, `system_prompt` (`{categories}` is replaced with the list), model options | `category` |
 | `switch` | `cases`: `[{conditions: [{var, op, value}], logic: "and"/"or", next}]`, `default`. Ops: `== != > >= < <= contains not_contains empty not_empty` | `case` |
@@ -267,13 +268,31 @@ Adding a node type: a function in `workflows/nodes.py` (`RUNNERS`), its params m
 
 ## Models
 
+A node without a profile uses the server of the `.env` settings:
+
 | setting | |
 |---|---|
 | `LLM_PROVIDER=openai` | OpenAI, or any OpenAI-compatible server: set `OPENAI_BASE_URL` (LiteLLM proxy, vLLM, Ollama...) and `OPENAI_MODEL`. Uses Chat Completions. |
 | `LLM_PROVIDER=anthropic` | Claude via the `anthropic` SDK, `ANTHROPIC_MODEL` (default `claude-opus-5-5`). Declined requests are retried on a fallback model server-side (`ANTHROPIC_FALLBACKS`, Claude API only). |
 | `EMBEDDING_*` | Always an OpenAI-compatible endpoint (Anthropic has no embeddings API). Defaults to `text-embedding-3-small`, 1536 dimensions. |
 
-A node can override `provider`, `model`, `temperature`, `effort` and `max_tokens`, e.g. a cheaper model for `categorize` and `rewrite`. `temperature` is unset by default because current reasoning models reject it.
+A node can override `provider`, `model`, `temperature`, `effort` and `max_tokens`, e.g. a cheaper model for `categorize` and `rewrite`. `temperature` is unset by default because current reasoning models reject it (current Claude models, too, only take their default).
+
+**LLM profiles** let nodes of one workflow call different servers. Add them in the admin (`/admin/` → Language models → LLM profiles): a name, a kind (`openai`: OpenAI or any OpenAI-compatible server; `anthropic`), a base URL, an API key and a default model. A node picks one by name, in the studio from the Model section's Profile dropdown:
+
+```json
+"router": {"type": "llm", "params": {"profile": "local", "model": "search-model", "max_tokens": 60}, "next": "route"},
+"answer": {"type": "llm", "params": {"profile": "liara", "system_prompt": "..."}, "next": "reply"}
+```
+
+- The node's `model` is sent to the profile's server; empty: the profile's default model. A node sets a `profile` or a `provider`, not both.
+- Workflows name profiles rather than ids, so a workflow exported from one database works in another that has profiles with the same names. Renaming a profile updates the workflows that use it. A profile that a saved workflow uses can't be deleted: the admin lists the workflows and nodes instead.
+- Saving or test-running a workflow checks that its profiles exist (and have a default model where a node names none).
+- The API key is write-only: after saving, the admin shows its last 4 characters, and leaving the field empty keeps it. No API endpoint returns keys or URLs. Keys are stored in the database as entered, like data source URLs.
+- A profile's server never gets the `.env` key: a profile without a key sends none, and an empty base URL means api.openai.com or api.anthropic.com, not `OPENAI_BASE_URL`.
+- Changes in the admin apply on the next call, without a restart (a client is kept per URL and key).
+- `LLM_EFFORT`, `LLM_MAX_TOKENS` and `ANTHROPIC_FALLBACKS` apply to every node, with a profile or without.
+- Embeddings stay in `.env` (`EMBEDDING_*`): every knowledge base shares one vector column, so they can't differ per profile.
 
 `EMBEDDING_DIMENSIONS` is fixed by the first migration (the column is `vector(1536)`). To change the embedding model, start with a new database (or write a migration that changes the column and re-sync).
 
@@ -294,7 +313,7 @@ query ──► embedding ──► DiskANN index, filtered by knowledge base in
 - `python manage.py worker`: runs queued syncs and scheduled ones. Run one or several; a job runs once (`FOR UPDATE SKIP LOCKED`), and a Postgres advisory lock makes sure a source is never synced twice at the same time. A failing source is retried once per `sync_interval_minutes`. Jobs of a worker that died are marked failed.
 - Behind an HTTPS reverse proxy, set `CSRF_TRUSTED_ORIGINS` and `BEHIND_HTTPS_PROXY=true` (needed to log in to the studio and the admin).
 - `GET /api/status`: index types, counts, queued jobs.
-- `/admin/`: browse knowledge bases, documents, chunks, sources (with a "Sync now" action), jobs, workflows and conversations.
+- `/admin/`: browse knowledge bases, documents, chunks, sources (with a "Sync now" action), jobs, workflows and conversations; manage LLM profiles.
 - `python manage.py rebuild_search_indexes`: after installing extensions or changing `TEXT_SEARCH_CONFIG`.
 
 ## Code, in reading order
@@ -303,7 +322,7 @@ query ──► embedding ──► DiskANN index, filtered by knowledge base in
 2. `knowledge/sources.py`: MySQL rows → documents; the sync.
 3. `knowledge/ingest.py` + `chunking.py`: documents → chunks → embeddings, skipping what didn't change.
 4. `knowledge/search.py` + `search_indexes.py`: the hybrid and metadata search SQL, filters and sorting, and the indexes.
-5. `core/llm.py`: one small interface (`stream`, `parse`, `run_tools`) over the OpenAI and Anthropic SDKs.
+5. `core/llm.py`: one small interface (`stream`, `parse`, `run_tools`) over the OpenAI and Anthropic SDKs; `core/models.py`: LLM profiles.
 6. `workflows/dsl.py` → `engine.py` → `nodes.py`: the workflow format, how it becomes a LangGraph graph, what each node does.
 7. `knowledge/api.py`, `workflows/api.py`: the HTTP API.
 8. `studio/static/studio/js/`: the editor. `editor.js` (the page: changes, undo, save), `canvas.js` (drawing and dragging), `form.js` (forms from the param schemas), `testrun.js` (the test chat) and `runlog.js` (the run log), `graph.js` (pure helpers).

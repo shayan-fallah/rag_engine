@@ -95,7 +95,7 @@ def get_graph(workflow) -> tuple[WorkflowSpec, object]:
     """Compiled graphs are cached until the workflow changes."""
     key = (workflow.pk, workflow.updated_at)
     if key not in _graphs:
-        spec = validate_dsl(workflow.dsl, check_kbs=False)
+        spec = validate_dsl(workflow.dsl, check_db=False)
         if len(_graphs) > 200:
             _graphs.clear()
         _graphs[key] = (spec, build_graph(spec))

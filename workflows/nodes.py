@@ -66,12 +66,15 @@ def chat_messages(state: dict, history: int, prompt: str) -> list[dict]:
 
 
 def llm_for(params):
-    return get_llm(params.provider, params.model, params.temperature, params.effort, params.max_tokens)
+    return get_llm(
+        params.provider, params.model, params.temperature, params.effort, params.max_tokens, profile=params.profile
+    )
 
 
 def model_info(llm) -> dict:
-    """The model a node uses, with the server defaults filled in."""
+    """The model a node uses, with the server defaults filled in (never the profile's URL or key)."""
     info = {
+        "profile": llm.profile,
         "provider": llm.provider,
         "model": llm.model,
         "temperature": llm.temperature,

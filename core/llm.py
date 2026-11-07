@@ -4,6 +4,9 @@
   OpenAI-compatible server (LiteLLM proxy, vLLM, Ollama, ...) via OPENAI_BASE_URL.
 - provider "anthropic": the Claude Messages API.
 
+A node either uses the server of the .env settings (provider + OPENAI_* / ANTHROPIC_*)
+or names an LLM profile (core/models.py): a server with its own URL and key.
+
 Messages are plain dicts: {"role": "user" | "assistant", "content": str}.
 The system prompt is passed separately.
 """
@@ -11,7 +14,7 @@ The system prompt is passed separately.
 import json
 import logging
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, TypeVar
 
@@ -19,6 +22,8 @@ import anthropic
 import openai
 from django.conf import settings
 from pydantic import BaseModel
+
+from core.models import DEFAULT_BASE_URLS, LLMProfile
 
 log = logging.getLogger(__name__)
 
@@ -68,14 +73,29 @@ class _AnswerText:
         return "\n\n".join(r for r in self.rounds if r)
 
 
-@lru_cache
-def _openai() -> openai.OpenAI:
-    return openai.OpenAI(max_retries=3)
+@dataclass(frozen=True)
+class Server:
+    """Where a profile's requests go. None instead of a Server: the .env settings."""
+
+    base_url: str
+    api_key: str = field(repr=False)
 
 
-@lru_cache
-def _anthropic() -> anthropic.Anthropic:
-    return anthropic.Anthropic(max_retries=3)
+# One client per server, cached by URL and key: a profile edited in the admin gets a new
+# client on its next use, without a restart.
+@lru_cache(maxsize=32)
+def _openai(server: Server | None = None) -> openai.OpenAI:
+    if server is None:
+        return openai.OpenAI(max_retries=3)  # OPENAI_BASE_URL / OPENAI_API_KEY
+    # Passing both keeps the SDK from reading them from .env. It needs some key: servers without one ignore it.
+    return openai.OpenAI(base_url=server.base_url, api_key=server.api_key or "none", max_retries=3)
+
+
+@lru_cache(maxsize=32)
+def _anthropic(server: Server | None = None) -> anthropic.Anthropic:
+    if server is None:
+        return anthropic.Anthropic(max_retries=3)  # ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY
+    return anthropic.Anthropic(base_url=server.base_url, api_key=server.api_key, max_retries=3)
 
 
 def get_llm(
@@ -84,9 +104,21 @@ def get_llm(
     temperature: float | None = None,
     effort: str | None = None,
     max_tokens: int | None = None,
+    profile: str | None = None,
 ) -> "LLM":
-    provider = provider or settings.LLM_PROVIDER
+    """A chat model on the server of the LLM profile named `profile`, or else of the .env settings."""
     effort = effort or settings.LLM_EFFORT or None
+    if profile:
+        found = LLMProfile.objects.filter(name=profile).first()
+        if found is None:
+            raise LLMError(f"LLM profile {profile!r} does not exist; add it in the admin")
+        model = model or found.default_model
+        if not model:
+            raise LLMError(f"LLM profile {profile!r} has no default model; set the node's model")
+        server = Server(found.base_url or DEFAULT_BASE_URLS[found.kind], found.api_key)
+        chat = OpenAIChat if found.kind == "openai" else AnthropicChat
+        return chat(model, temperature, effort, max_tokens, server=server, profile=profile)
+    provider = provider or settings.LLM_PROVIDER
     if provider == "openai":
         return OpenAIChat(model or settings.OPENAI_MODEL, temperature, effort, max_tokens)
     if provider == "anthropic":
@@ -97,12 +129,22 @@ def get_llm(
 class LLM:
     provider = ""
 
-    def __init__(self, model: str, temperature: float | None, effort: str | None, max_tokens: int | None = None):
+    def __init__(
+        self,
+        model: str,
+        temperature: float | None,
+        effort: str | None,
+        max_tokens: int | None = None,
+        server: Server | None = None,
+        profile: str | None = None,
+    ):
         self.model = model
         # Left unset by default: current reasoning models reject a custom temperature.
         self.temperature = temperature
         self.effort = effort
         self.max_tokens = max_tokens  # None: LLM_MAX_TOKENS for Claude, the model's limit for OpenAI
+        self.server = server  # None: the .env settings
+        self.profile = profile  # the profile's name, for the run log
 
     def stream(self, system: str, messages: list[dict]) -> Iterator[str]:
         """Yield the answer text as it is generated."""
@@ -148,13 +190,15 @@ class OpenAIChat(LLM):
         return params
 
     def stream(self, system, messages):
-        response = _openai().chat.completions.create(**self._params(system, messages), stream=True)
+        response = _openai(self.server).chat.completions.create(**self._params(system, messages), stream=True)
         for chunk in response:
             if chunk.choices and chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
 
     def parse(self, system, messages, schema):
-        completion = _openai().chat.completions.parse(**self._params(system, messages), response_format=schema)
+        completion = _openai(self.server).chat.completions.parse(
+            **self._params(system, messages), response_format=schema
+        )
         message = completion.choices[0].message
         if message.parsed is None:
             raise LLMError(f"No structured output (refusal: {message.refusal!r})")
@@ -175,7 +219,7 @@ class OpenAIChat(LLM):
 
         for round_no in range(max_rounds + 1):
             last_round = round_no == max_rounds
-            response = _openai().chat.completions.create(
+            response = _openai(self.server).chat.completions.create(
                 **params,
                 messages=history,
                 tools=specs,
@@ -235,7 +279,9 @@ class AnthropicChat(LLM):
         if system:
             params["system"] = system
         if self.temperature is not None:
-            params["temperature"] = self.temperature
+            # Not an SDK argument any more: current Claude models only take their default (a 400 says so),
+            # older ones (e.g. Claude Sonnet 4.6) still accept it.
+            params["extra_body"] = {"temperature": self.temperature}
         if self.effort:
             params["output_config"] = {"effort": self.effort}
         if settings.ANTHROPIC_FALLBACKS:
@@ -245,7 +291,7 @@ class AnthropicChat(LLM):
         return params
 
     def stream(self, system, messages):
-        with _anthropic().beta.messages.stream(**self._params(system, messages)) as stream:
+        with _anthropic(self.server).beta.messages.stream(**self._params(system, messages)) as stream:
             yield from stream.text_stream
             final = stream.get_final_message()
         if final.stop_reason == "refusal":
@@ -254,7 +300,7 @@ class AnthropicChat(LLM):
     def parse(self, system, messages, schema):
         # Not streamed, so keep max_tokens below the SDK's limit for non-streaming requests.
         params = self._params(system, messages, max_tokens=min(self.max_tokens or settings.LLM_MAX_TOKENS, 16000))
-        response = _anthropic().beta.messages.parse(**params, output_format=schema)
+        response = _anthropic(self.server).beta.messages.parse(**params, output_format=schema)
         if response.stop_reason == "refusal" or response.parsed_output is None:
             raise LLMError(f"No structured output (stop_reason: {response.stop_reason})")
         return response.parsed_output
@@ -276,7 +322,7 @@ class AnthropicChat(LLM):
         for round_no in range(max_rounds + 1):
             last_round = round_no == max_rounds
             params = self._params(system, history)
-            with _anthropic().beta.messages.stream(
+            with _anthropic(self.server).beta.messages.stream(
                 **params,
                 tools=specs,
                 tool_choice={"type": "none"} if last_round else {"type": "auto"},

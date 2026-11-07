@@ -19,6 +19,7 @@ export class EditorPage {
     this.sysVars = app.sysVars;
     this.modelDefaults = app.modelDefaults;
     this.kbs = app.kbs;
+    this.llmProfiles = app.llmProfiles;
     this.apiRoot = config.apiRoot;
     this.selection = null;
     this.errors = [];
@@ -40,9 +41,11 @@ export class EditorPage {
 
   async load(id) {
     try {
-      const [workflow, kbs] = await Promise.all([api.get(`workflows/${id}`), api.get('kbs')]);
+      // Knowledge bases and LLM profiles again: they may have changed in the admin since the studio opened.
+      const [workflow, kbs, llmProfiles] = await Promise.all([api.get(`workflows/${id}`), api.get('kbs'), api.get('llm-profiles')]);
       this.workflow = workflow;
       this.kbs = this.app.kbs = kbs;
+      this.llmProfiles = this.app.llmProfiles = llmProfiles;
     } catch (err) {
       if (this.destroyed) return;
       this.root.replaceChildren(h('div', { class: 'boot error' },

@@ -117,10 +117,12 @@ export class Canvas {
         lines.push(parts.join(' · '));
         break;
       }
-      case 'llm':
+      case 'llm': {
         lines.push(p.system_prompt ? clip(p.system_prompt) : 'No system prompt');
-        if (p.model || p.provider) lines.push(p.model || p.provider);
+        const model = p.profile ? [p.profile, p.model].filter(Boolean).join(' · ') : p.model || p.provider;
+        if (model) lines.push(model);
         break;
+      }
       case 'agent':
         lines.push(`Tools: ${(p.tools || []).map((t) => (t.metadata_fields?.length ? `${t.name} (+ metadata)` : t.name)).join(', ') || 'none'}`);
         if (p.system_prompt) lines.push(clip(p.system_prompt, 60));

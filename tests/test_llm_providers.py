@@ -343,6 +343,10 @@ def test_anthropic_parse_and_effort(anthropic_api, settings):
     body = anthropic_api.requests[0]["body"]
     assert body["output_config"]["effort"] == "low" and "fallbacks" not in body
 
+    anthropic_api.script = [{"text": "ok"}]
+    "".join(get_llm("anthropic", "claude-sonnet-4-6", temperature=0.2).stream("", [{"role": "user", "content": "x"}]))
+    assert anthropic_api.requests[1]["body"]["temperature"] == 0.2  # sent as is; current models answer with a 400
+
 
 def test_anthropic_tool_loop(anthropic_api):
     anthropic_api.script = [
@@ -408,3 +412,120 @@ def test_max_tokens_per_node(openai_api, anthropic_api):
     "".join(get_llm("anthropic", max_tokens=500).stream("", [{"role": "user", "content": "x"}]))
     get_llm("anthropic", max_tokens=500).parse("", [{"role": "user", "content": "x"}], Choice)
     assert [r["body"]["max_tokens"] for r in anthropic_api.requests] == [500, 500]
+
+
+# --- LLM profiles: each node on its own server ---------------------------------------------
+
+
+def header(request: dict, name: str) -> str | None:
+    return {k.lower(): v for k, v in request["headers"].items()}.get(name.lower())
+
+
+@pytest.fixture
+def servers(openai_api, transactional_db):
+    """Two more OpenAI-compatible servers for profiles; `openai_api` is the .env one (key "test").
+
+    transactional_db: workflow nodes run in other threads, which must see the profiles.
+    """
+    from core.models import LLMProfile
+
+    local, liara = FakeAPI(openai_render), FakeAPI(openai_render)
+    LLMProfile.objects.create(name="local", base_url=local.url + "/v1", default_model="search-model")
+    LLMProfile.objects.create(name="liara", base_url=liara.url + "/v1", api_key="liara-key", default_model="gpt-4.1")
+    yield local, liara
+    local.close()
+    liara.close()
+
+
+def test_profile_calls_its_own_server(servers, openai_api):
+    from core.models import LLMProfile
+
+    local, liara = servers
+    liara.script = [{"text": "Hello world"}, {"text": "ok"}, {"text": "ok"}]
+    llm = get_llm(profile="liara")
+    assert "".join(llm.stream("", [{"role": "user", "content": "hi"}])) == "Hello world"
+    request = liara.requests[0]
+    assert request["path"] == "/v1/chat/completions" and request["body"]["model"] == "gpt-4.1"
+    assert header(request, "Authorization") == "Bearer liara-key"
+    assert openai_api.requests == [] and local.requests == []
+
+    list(get_llm(model="openai/gpt-4.1", profile="liara").stream("", [{"role": "user", "content": "x"}]))
+    assert liara.requests[1]["body"]["model"] == "openai/gpt-4.1"  # the node's model wins
+
+    # An edit in the admin applies on the next call, without a restart.
+    LLMProfile.objects.filter(name="liara").update(api_key="new-key")
+    list(get_llm(profile="liara").stream("", [{"role": "user", "content": "x"}]))
+    assert header(liara.requests[2], "Authorization") == "Bearer new-key"
+
+
+def test_profile_never_gets_the_env_key(servers, openai_api, anthropic_api):
+    from core.models import LLMProfile
+
+    local, _ = servers
+    local.script = [{"text": "ok"}]
+    list(get_llm(profile="local").stream("", [{"role": "user", "content": "x"}]))
+    assert header(local.requests[0], "Authorization") == "Bearer none"  # not OPENAI_API_KEY ("test")
+
+    # An Anthropic profile: its own URL and key, not ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY.
+    claude = FakeAPI(anthropic_render)
+    try:
+        LLMProfile.objects.create(name="claude", kind="anthropic", base_url=claude.url, api_key="claude-key")
+        claude.script = [{"text": "Hello world"}]
+        llm = get_llm(model="claude-test", profile="claude")
+        assert "".join(llm.stream("", [{"role": "user", "content": "hi"}])) == "Hello world"
+        assert header(claude.requests[0], "x-api-key") == "claude-key"
+        assert claude.requests[0]["body"]["model"] == "claude-test"
+        assert anthropic_api.requests == []
+    finally:
+        claude.close()
+
+
+def test_missing_profile_or_model_is_a_clear_error(servers):
+    from core.models import LLMProfile
+
+    with pytest.raises(llm_module.LLMError, match="LLM profile 'nope' does not exist"):
+        get_llm(profile="nope")
+    LLMProfile.objects.filter(name="local").update(default_model="")
+    with pytest.raises(llm_module.LLMError, match="has no default model"):
+        get_llm(profile="local")
+
+
+def test_nodes_of_one_workflow_use_different_servers(servers, openai_api):
+    """route -> local server, answer -> Liara, recap (no profile) -> the .env server."""
+    from workflows.engine import run_draft
+
+    local, liara = servers
+    local.script = [{"text": "products"}]
+    liara.script = [{"text": "Here you go."}]
+    openai_api.script = [{"text": "Recap."}]
+    dsl = {
+        "nodes": {
+            "begin": {"type": "begin", "next": "route"},
+            "route": {"type": "llm", "params": {"profile": "local", "max_tokens": 60}, "next": "answer"},
+            "answer": {
+                "type": "llm",
+                "params": {"profile": "liara", "model": "openai/gpt-4.1", "system_prompt": "Topic: {route@content}"},
+                "next": "recap",
+            },
+            "recap": {"type": "llm", "params": {"model": "gpt-test"}, "next": "reply"},
+            "reply": {"type": "message", "params": {"text": "{answer@content} {recap@content}"}},
+        }
+    }
+    events = list(run_draft(dsl, "phones?"))
+
+    assert events[-1]["event"] == "done" and events[-1]["answer"] == "Here you go. Recap."
+    assert [r["body"]["model"] for r in local.requests] == ["search-model"]
+    assert local.requests[0]["body"]["max_completion_tokens"] == 60
+    assert [r["body"]["model"] for r in liara.requests] == ["openai/gpt-4.1"]
+    assert liara.requests[0]["body"]["messages"][0] == {"role": "system", "content": "Topic: products"}
+    assert header(liara.requests[0], "Authorization") == "Bearer liara-key"
+    assert [r["body"]["model"] for r in openai_api.requests] == ["gpt-test"]
+    assert header(openai_api.requests[0], "Authorization") == "Bearer test"
+
+    # The run log names each node's profile, and never shows a URL or key.
+    finished = {e["node"]: e for e in events if e["event"] == "node_finished"}
+    models = {node: finished[node]["inputs"]["model"] for node in ("route", "answer", "recap")}
+    assert models["route"] == {"profile": "local", "provider": "openai", "model": "search-model", "max_tokens": 60}
+    assert models["answer"]["profile"] == "liara" and "profile" not in models["recap"]
+    log = json.dumps(events)
+    assert "liara-key" not in log and liara.url not in log and local.url not in log

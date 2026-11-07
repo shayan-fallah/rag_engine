@@ -1,4 +1,4 @@
-// Studio entry point: loads node types and knowledge bases, then routes
+// Studio entry point: loads node types, knowledge bases and LLM profiles, then routes
 //   #/        the workflow list
 //   #/w/<id>  the editor
 
@@ -8,16 +8,17 @@ import { ListPage } from './list.js';
 import { confirmDialog, h } from './ui.js';
 
 const root = document.getElementById('app');
-const app = { current: null, types: {}, sysVars: {}, modelDefaults: {}, kbs: [] };
+const app = { current: null, types: {}, sysVars: {}, modelDefaults: {}, kbs: [], llmProfiles: [] };
 let currentHash = null;
 
 async function boot() {
   try {
-    const [meta, kbs] = await Promise.all([api.get('node-types'), api.get('kbs')]);
+    const [meta, kbs, llmProfiles] = await Promise.all([api.get('node-types'), api.get('kbs'), api.get('llm-profiles')]);
     app.types = Object.fromEntries(meta.types.map((t) => [t.type, t]));
     app.sysVars = meta.sys_vars;
     app.modelDefaults = meta.model_defaults;
     app.kbs = kbs;
+    app.llmProfiles = llmProfiles;
   } catch (err) {
     root.replaceChildren(h('div', { class: 'boot error' }, h('h1', null, 'Could not load the studio'), h('p', null, err.message)));
     return;

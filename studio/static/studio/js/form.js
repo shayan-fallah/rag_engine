@@ -1,6 +1,7 @@
 // Settings forms, built from the JSON schema of each node type's params (GET /api/node-types).
 // Every param of the engine shows up here; json_schema_extra hints pick the widget.
 
+import { config } from './api.js';
 import { NODE_ID, ROUTERS, nodeOutputs, outPorts, variablesFor } from './graph.js';
 import {
   autoGrow, button, clone, closePopover, deepEqual, formatLoose, h, icon, iconButton,
@@ -8,6 +9,7 @@ import {
 } from './ui.js';
 
 const GROUP_TITLES = { model: 'Model', metadata: 'Metadata search', advanced: 'Advanced' };
+const KIND_LABELS = { openai: 'OpenAI-compatible', anthropic: 'Anthropic' };
 // Field ids follow the setting's path, so the editor can put the focus back after redrawing the panel.
 const fieldId = (path) => `f-${path.replace(/[^A-Za-z0-9_-]/g, '-')}`;
 
@@ -115,21 +117,30 @@ function renderFields(obj, schema, root, ctx, path) {
   return out;
 }
 
-// hide_when: {param: [values]} or {param: "empty"}; hidden when any of them holds.
+// hide_when: {param: [values]}, {param: "empty"} or {param: "not_empty"}; hidden when any of them holds.
 function hidden(f, obj) {
   const when = f.prop.hide_when;
-  return !!when && Object.entries(when).some(([key, values]) => (values === 'empty' ? isEmpty(obj[key]) : values.includes(obj[key])));
+  return !!when && Object.entries(when).some(([key, values]) => {
+    if (values === 'empty') return isEmpty(obj[key]);
+    if (values === 'not_empty') return !isEmpty(obj[key]);
+    return values.includes(obj[key]);
+  });
 }
 
 function renderField(obj, f, root, ctx, path) {
   const id = fieldId(`${path}.${f.name}`);
   const key = `${ctx.nodeId}:${path}.${f.name}`;
   const value = currentValue(obj, f);
+  // clears: settings that can't go with this one (a profile replaces the provider) are emptied when it is set.
+  const apply = (target, v) => {
+    storeValue(target, f, v);
+    if (!isEmpty(v)) for (const name of f.prop.clears || []) delete target[name];
+  };
   const set = (v, { structural = false } = {}) => {
     const trial = { ...obj };
-    storeValue(trial, f, v);
+    apply(trial, v);
     const toggles = ctx.visibility && ctx.visibility(trial) !== ctx.visibility(obj);
-    ctx.change(key, () => storeValue(obj, f, v), structural || toggles);
+    ctx.change(key, () => apply(obj, v), structural || toggles);
   };
   // "Reset" only where the default is something (a prompt, a number), not for empty defaults.
   const customized = obj[f.name] !== undefined && f.prop.default !== undefined && !isEmpty(f.prop.default)
@@ -147,11 +158,21 @@ function renderField(obj, f, root, ctx, path) {
     f.prop.description ? h('div', { class: 'help' }, f.prop.description) : null);
 }
 
+// The LLM profile a node uses: {name, kind, default_model}, {name, missing: true} or null (the .env settings).
+function profileOf(obj, ctx) {
+  if (!obj.profile) return null;
+  return ctx.editor.llmProfiles.find((p) => p.name === obj.profile) || { name: obj.profile, missing: true };
+}
+
 function placeholderFor(f, ctx, obj) {
   const d = ctx.editor.modelDefaults;
-  const provider = obj.provider || d.provider;
+  const profile = profileOf(obj, ctx);
+  const provider = profile ? profile.kind : obj.provider || d.provider;
   switch (f.name) {
-    case 'model': return `Default: ${provider === 'anthropic' ? d.anthropic_model : d.openai_model}`;
+    case 'model':
+      if (profile?.missing) return 'The profile does not exist';
+      if (profile) return profile.default_model ? `Default: ${profile.default_model}` : 'Required: the profile has no default model';
+      return `Default: ${provider === 'anthropic' ? d.anthropic_model : d.openai_model}`;
     case 'temperature': return 'Model default';
     case 'max_tokens': return provider === 'anthropic' ? `Default: ${d.max_tokens}` : 'Model default';
     case 'max_distance': return 'No limit';
@@ -198,13 +219,29 @@ const WIDGETS = {
 
   model({ value, set, f, ctx, id, obj }) {
     const d = ctx.editor.modelDefaults;
+    const profile = profileOf(obj, ctx);
+    const suggestions = profile ? [profile.default_model] : [d.openai_model, d.anthropic_model];
     const listId = `${id}-models`;
     return h('div', null,
       h('input', {
         id, type: 'text', value: value ?? '', placeholder: placeholderFor(f, ctx, obj), list: listId, spellcheck: 'false',
         onInput: (e) => set(e.target.value.trim() || null),
       }),
-      h('datalist', { id: listId }, [d.openai_model, d.anthropic_model].filter(Boolean).map((m) => h('option', { value: m }))));
+      h('datalist', { id: listId }, suggestions.filter(Boolean).map((m) => h('option', { value: m }))));
+  },
+
+  // An LLM profile (a model server set up in the admin), or none: the server's .env settings.
+  profile({ value, set, ctx, id }) {
+    const profiles = ctx.editor.llmProfiles;
+    const options = [
+      h('option', { value: '' }, `None (server settings: ${ctx.editor.modelDefaults.provider})`),
+      ...profiles.map((p) => h('option', { value: p.name }, `${p.name} (${KIND_LABELS[p.kind] || p.kind})`)),
+    ];
+    if (value && !profiles.some((p) => p.name === value)) options.push(h('option', { value }, `${value} (does not exist)`));
+    const select = h('select', { id, value: value ?? '', onChange: (e) => set(e.target.value || null, { structural: true }) }, options);
+    return h('div', null, select,
+      h('div', { class: 'help' }, profiles.length ? '' : 'No profiles yet. ',
+        h('a', { href: config.llmProfilesUrl, target: '_blank', rel: 'noopener' }, 'Manage profiles in the admin')));
   },
 
   textarea({ value, set, id }) {

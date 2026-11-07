@@ -19,6 +19,7 @@ def index(request):
         "apiRoot": reverse(f"{api.urls_namespace}:api-root"),
         "user": request.user.get_username(),
         "adminUrl": reverse("admin:index"),
+        "llmProfilesUrl": reverse("admin:core_llmprofile_changelist"),
         "logoutUrl": reverse("admin:logout"),
         "docsUrl": reverse(f"{api.urls_namespace}:openapi-view"),
     }
