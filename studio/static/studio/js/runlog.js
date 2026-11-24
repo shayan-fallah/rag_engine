@@ -157,8 +157,9 @@ export class RunLog {
     h('span', { class: `node-icon small t-${step.type}` }, icon(step.type)),
     h('span', { class: 'log-node' }, step.node),
     h('span', { class: 'muted log-type' }, info?.title || step.type),
-    tools.length ? h('span', { class: 'pill' }, `${tools.length} search${tools.length === 1 ? '' : 'es'}`) : null,
+    tools.length ? h('span', { class: 'pill' }, toolCount(tools)) : null,
     step.status === 'done' && step.next !== undefined ? h('span', { class: 'muted log-next' }, `→ ${step.next || 'end'}`) : null,
+    step.status === 'failed' && step.next ? h('span', { class: 'muted log-next' }, `→ ${step.next} (on error)`) : null,
     h('span', { class: 'step-ms' }, step.status === 'running' ? 'running…' : formatMs(step.ms)));
     const card = h('div', { class: `log-step ${step.status}${open ? ' open' : ''}`, dataset: { node: step.node } }, head);
     if (open) card.append(this.renderStepBody(step));
@@ -170,7 +171,10 @@ export class RunLog {
     if (step.error) parts.push(h('div', { class: 'log-error' }, icon('alert'), h('span', null, step.error)));
     const inputs = Object.entries(step.inputs || {});
     if (inputs.length) parts.push(logSection('Input', inputs.map(([k, v]) => this.entry(LABELS[k] || k, v, k))));
-    if (step.tools?.length) parts.push(logSection('Searches the model made', step.tools.map((t, j) => this.toolCall(t, j))));
+    if (step.tools?.length) {
+      const title = step.tools.some((t) => t.kind === 'calculator') ? 'Tools the model used' : 'Searches the model made';
+      parts.push(logSection(title, step.tools.map((t, j) => this.toolCall(t, j))));
+    }
     const outputs = Object.entries(step.outputs || {});
     if (outputs.length) {
       parts.push(logSection('Output', outputs.map(([k, v]) => this.entry(`{${step.node}@${k}}`, v, k))));
@@ -200,13 +204,15 @@ export class RunLog {
 
   toolCall(call, index) {
     const args = call.arguments || {};
-    const kind = !call.query ? 'Metadata only' : (args.filters?.length || args.sort_by) ? 'Query + metadata' : 'Query';
+    const calc = call.kind === 'calculator';
+    const kind = calc ? 'Calculator' : !call.query ? 'Metadata only' : (args.filters?.length || args.sort_by) ? 'Query + metadata' : 'Query';
+    const count = calc ? `${call.results} calculation${call.results === 1 ? '' : 's'}` : `${call.results} result${call.results === 1 ? '' : 's'}`;
     return h('div', { class: `log-tool${call.error ? ' failed' : ''}` },
       h('div', { class: 'log-tool-head' },
         h('span', { class: 'log-tool-n' }, `#${index + 1}`),
         h('code', null, call.tool),
         h('span', { class: 'pill' }, kind),
-        h('span', { class: 'muted' }, call.error ? 'error' : `${call.results} result${call.results === 1 ? '' : 's'}`),
+        h('span', { class: 'muted' }, call.error ? 'error' : count),
         h('span', { class: 'step-ms' }, formatMs(call.elapsed_ms))),
       this.entry('Arguments', args),
       call.error ? h('div', { class: 'log-error' }, icon('alert'), h('span', null, `${call.error} (sent to the model, which can try again)`)) : null,
@@ -376,6 +382,15 @@ function toolView(tool) {
     tool.skipped_filters ? h('div', { class: 'log-entry' }, h('div', { class: 'log-label' }, 'Filters skipped (empty value)'),
       inline(tool.skipped_filters.join('  and  '))) : null,
     h('div', { class: 'log-entry' }, h('div', { class: 'log-label' }, 'Arguments (JSON schema)'), textBlock(JSON.stringify(tool.parameters, null, 2), 'json')));
+}
+
+// "2 searches", "1 calculation" or "3 tool calls" for a step's pill.
+function toolCount(tools) {
+  const calcs = tools.filter((t) => t.kind === 'calculator').length;
+  const n = tools.length;
+  if (!calcs) return `${n} search${n === 1 ? '' : 'es'}`;
+  if (calcs === n) return `${n} calculation${n === 1 ? '' : 's'}`;
+  return `${n} tool calls`;
 }
 
 function formatMs(ms) {

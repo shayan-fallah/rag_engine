@@ -1,6 +1,6 @@
 // The node canvas: draws nodes and edges, and handles dragging, connecting, panning and zooming.
 
-import { edges, outPorts, ROUTERS } from './graph.js';
+import { ERROR_PORT, edges, outPorts, ROUTERS } from './graph.js';
 import { h, icon, iconButton, svg } from './ui.js';
 
 const MIN_ZOOM = 0.25;
@@ -90,6 +90,12 @@ export class Canvas {
       const [port] = outPorts(node);
       el.append(h('div', { class: `port out ${port.target ? 'connected' : ''}`, dataset: { port: 'next' }, title: 'Drag to connect' }));
     }
+    if (node.type !== 'begin') {
+      el.append(h('div', {
+        class: `port out err ${node.on_error ? 'connected' : ''}`, dataset: { port: ERROR_PORT },
+        title: 'If this node fails, go to… (drag to connect)',
+      }));
+    }
     return el;
   }
 
@@ -176,14 +182,16 @@ export class Canvas {
       if (!a || !b) continue;
       const end = { x: b.x - 6, y: b.y };
       const selected = selection?.type === 'edge' && selection.node === e.from && selection.port === e.port;
-      const ran = runState[e.from]?.status === 'done' && runState[e.to];
-      const g = svg('g', { class: `edge${selected ? ' selected' : ''}${ran ? ' ran' : ''}`, 'data-from': e.from, 'data-port': e.port });
-      const d = curve(a, end);
+      const ran = runState[e.from]?.status === (e.error ? 'failed' : 'done') && runState[e.to];
+      const g = svg('g', {
+        class: `edge${e.error ? ' error' : ''}${selected ? ' selected' : ''}${ran ? ' ran' : ''}`, 'data-from': e.from, 'data-port': e.port,
+      });
+      const d = curve(a, end, e.error);
       g.append(svg('path', { d, class: 'edge-hit' }), svg('path', { d, class: 'edge-line' }),
         svg('path', { d: `M${end.x - 7},${end.y - 4.5} L${end.x + 1},${end.y} L${end.x - 7},${end.y + 4.5} Z`, class: 'edge-arrow' }));
       groups.push(g);
       if (selected) {
-        const mid = midpoint(a, end);
+        const mid = midpoint(a, end, e.error);
         this.edgeButton.style.left = `${mid.x}px`;
         this.edgeButton.style.top = `${mid.y}px`;
         this.edgeButton.hidden = false;
@@ -191,7 +199,7 @@ export class Canvas {
     }
     const g = this.gesture;
     if (g?.kind === 'connect' && g.point) {
-      groups.push(svg('path', { d: curve(g.start, g.point), class: 'edge-line connecting' }));
+      groups.push(svg('path', { d: curve(g.start, g.point, g.port === ERROR_PORT), class: 'edge-line connecting' }));
     }
     this.edgeLayer.replaceChildren(...groups);
   }
@@ -402,15 +410,22 @@ export class Canvas {
   }
 }
 
-function curve(a, b) {
+// The two control points of an edge's cubic bezier. Edges leave a port to the right; on-error
+// edges leave their port (at the bottom of the node) downwards.
+function controls(a, b, down = false) {
   const back = b.x < a.x + 30;
   const dx = back ? Math.max(90, (a.x - b.x) * 0.4) : Math.max(40, (b.x - a.x) * 0.5);
-  return `M${a.x},${a.y} C${a.x + dx},${a.y} ${b.x - dx},${b.y} ${b.x},${b.y}`;
+  const first = down ? { x: a.x, y: a.y + Math.max(50, Math.abs(b.y - a.y) * 0.5) } : { x: a.x + dx, y: a.y };
+  return [first, { x: b.x - dx, y: b.y }];
 }
 
-function midpoint(a, b) {
-  const back = b.x < a.x + 30;
-  const dx = back ? Math.max(90, (a.x - b.x) * 0.4) : Math.max(40, (b.x - a.x) * 0.5);
+function curve(a, b, down = false) {
+  const [p1, p2] = controls(a, b, down);
+  return `M${a.x},${a.y} C${p1.x},${p1.y} ${p2.x},${p2.y} ${b.x},${b.y}`;
+}
+
+function midpoint(a, b, down = false) {
+  const [p1, p2] = controls(a, b, down);
   // Cubic bezier at t = 0.5: (p0 + 3 p1 + 3 p2 + p3) / 8
-  return { x: (a.x + 3 * (a.x + dx) + 3 * (b.x - dx) + b.x) / 8, y: (a.y + 3 * a.y + 3 * b.y + b.y) / 8 };
+  return { x: (a.x + 3 * p1.x + 3 * p2.x + b.x) / 8, y: (a.y + 3 * p1.y + 3 * p2.y + b.y) / 8 };
 }

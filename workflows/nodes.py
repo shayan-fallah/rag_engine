@@ -6,6 +6,7 @@ It reports progress with stream events (see engine.py), and records what it work
 with (the prompts it sent, the query it searched...) with emit.inputs() for the run log.
 """
 
+import logging
 import time
 from typing import Literal
 
@@ -23,8 +24,11 @@ from knowledge.search import (
     metadata_search,
     search,
 )
-from workflows.dsl import VAR_PATTERN, Node
+from workflows.calculator import calculate
+from workflows.dsl import CALCULATOR_TOOL, VAR_PATTERN, Node
 from workflows.variables import render, resolve
+
+log = logging.getLogger(__name__)
 
 
 class Emitter:
@@ -39,6 +43,7 @@ class Emitter:
         self.debug = bool(state.get("debug"))
         self.needs_separator = any(state["answer"])
         self.started = False
+        self.sent: list[str] = []  # answer text this node streamed, kept if the node fails halfway
         self.recorded: dict = {}
 
     def event(self, name: str, **data) -> None:
@@ -54,6 +59,7 @@ class Emitter:
         if not self.started and self.needs_separator:
             self.write({"event": "message", "delta": "\n\n"})
         self.started = True
+        self.sent.append(delta)
         self.write({"event": "message", "delta": delta})
 
 
@@ -246,6 +252,16 @@ def tool_arguments(spec, args: dict) -> tuple[str, list[dict], str | None, str]:
     return query, check_filters(filters), sort_by, order
 
 
+def tool_info(tool: Tool, fixed: list, skipped: list) -> dict:
+    """A tool as the run log shows it."""
+    info = {"name": tool.name, "description": tool.description, "parameters": tool.parameters}
+    if fixed:
+        info["fixed_filters"] = fixed
+    if skipped:
+        info["skipped_filters"] = skipped
+    return info
+
+
 def run_agent(node_id, node, state, emit, streamed):
     p = node.parsed
     refs: list[dict] = []
@@ -297,24 +313,51 @@ def run_agent(node_id, node, state, emit, streamed):
             name=spec.name, description=tool_description(spec, state), parameters=tool_parameters(spec), run=run
         )
 
+    def calculator() -> Tool:
+        def run(args: dict) -> str:
+            started = time.monotonic()
+            expressions = args.get("expressions")
+            call = {"tool": CALCULATOR_TOOL, "kind": "calculator", "arguments": args}
+            try:
+                result = calculate(expressions)
+                call["results"] = len(expressions)
+                if emit.debug:
+                    call["result"] = result
+                return result
+            except Exception as exc:
+                call["error"] = str(exc)  # the model gets it as the tool result and can retry
+                raise
+            finally:
+                call["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+                emit.event("tool_call", node=node_id, **call)
+
+        return Tool(
+            name=CALCULATOR_TOOL,
+            description=p.calculator_description,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "expressions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": 'The calculations, one per item, e.g. ["345 * 7", "345 * 20", "345 * 7 + 345 * 20"]',
+                    }
+                },
+                "required": ["expressions"],
+                "additionalProperties": False,
+            },
+            run=run,
+        )
+
     llm = llm_for(p)
     system = render(p.system_prompt, state)
     messages = chat_messages(state, p.history, render(p.prompt, state))
-    tools = [make_tool(t) for t in p.tools]
+    tools = [make_tool(t) for t in p.tools] + ([calculator()] if p.calculator else [])
     emit.inputs(
         model=model_info(llm),
         system_prompt=system,
         messages=messages,
-        tools=[
-            {
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.parameters,
-                **({"fixed_filters": fixed_filters[t.name][0]} if fixed_filters[t.name][0] else {}),
-                **({"skipped_filters": fixed_filters[t.name][1]} if fixed_filters[t.name][1] else {}),
-            }
-            for t in tools
-        ],
+        tools=[tool_info(t, *fixed_filters.get(t.name, ([], []))) for t in tools],
         max_rounds=p.max_rounds,
     )
     content = llm.run_tools(system, messages, tools, max_rounds=p.max_rounds, on_text=emit.text if streamed else None)
@@ -453,15 +496,24 @@ def make_node(node_id: str, node: Node, streamed: bool):
         try:
             update = runner(node_id, node, state, emit, streamed)
         except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
             emit.event(
                 "node_failed",
                 node=node_id,
                 type=node.type,
                 elapsed_ms=round((time.monotonic() - start) * 1000),
-                error=f"{type(exc).__name__}: {exc}",
+                error=error,
+                **({"next": node.on_error} if node.on_error else {}),
                 **details(),
             )
-            raise
+            if not node.on_error:
+                raise
+            # Go on at on_error instead of ending the run. The answer keeps what the user already saw.
+            log.warning("workflow node %s failed, going on at %s: %s", node_id, node.on_error, error, exc_info=True)
+            failed = {"outputs": {node_id: {"_next": node.on_error}}}
+            if emit.sent:
+                failed["answer"] = ["".join(emit.sent)]
+            return failed
         result = update.get("outputs", {}).get(node_id, {})
         outputs = {k: v for k, v in result.items() if not k.startswith("_")}
         emit.event(

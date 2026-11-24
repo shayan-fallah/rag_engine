@@ -234,6 +234,9 @@ kbd { padding: 1px 6px; border: 1px solid var(--border-strong); border-bottom-wi
 .edge.ran .edge-line { stroke: var(--ok); stroke-width: 2.5; }
 .edge.ran .edge-arrow { fill: var(--ok); }
 .edge-line.connecting { stroke: var(--accent); stroke-dasharray: 6 5; }
+.edge.error .edge-line { stroke: var(--danger); stroke-dasharray: 5 4; }
+.edge.error .edge-arrow { fill: var(--danger); }
+.edge.error.ran .edge-line { stroke: var(--danger); stroke-width: 2.5; }
 
 .edge-delete {
   position: absolute; z-index: 4; width: 24px; height: 24px; margin: -12px 0 0 -12px; padding: 0;
@@ -287,6 +290,11 @@ kbd { padding: 1px 6px; border: 1px solid var(--border-strong); border-bottom-wi
 .port.out { cursor: crosshair; transition: transform 0.1s; }
 .port.out.connected { border-color: var(--c); background: var(--c); }
 .port.out:hover { transform: scale(1.4); border-color: var(--c); }
+/* on_error: bottom centre, shown on hover, when selected or when connected */
+.node > .port.out.err { top: auto; right: auto; bottom: -7px; left: calc(50% - 6px); border-color: var(--danger); opacity: 0; transition: opacity 0.1s, transform 0.1s; }
+.node:hover > .port.out.err, .node.selected > .port.out.err, .node > .port.out.err.connected { opacity: 1; }
+.node > .port.out.err.connected { background: var(--danger); }
+.node > .port.out.err:hover { border-color: var(--danger); }
 
 .canvas-controls {
   position: absolute; left: 14px; bottom: 14px; z-index: 6; display: flex; flex-direction: column; gap: 2px; padding: 4px;

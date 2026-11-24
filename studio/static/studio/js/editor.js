@@ -4,7 +4,7 @@
 import { api, config } from './api.js';
 import { Canvas } from './canvas.js';
 import { outputList, renderEdgePanel, renderNodePanel, renderWorkflowPanel } from './form.js';
-import { autoLayout, clearTargets, newNodeId, outPorts, removeNode, renameNode, setTarget } from './graph.js';
+import { ERROR_PORT, autoLayout, clearTargets, links, newNodeId, outPorts, removeNode, renameNode, setTarget } from './graph.js';
 import { RunLog } from './runlog.js';
 import { TestPanel } from './testrun.js';
 import { button, clone, closePopover, confirmDialog, downloadJson, h, icon, iconButton, modal, popover, slug, toast } from './ui.js';
@@ -326,14 +326,17 @@ export class EditorPage {
       }
     }
     const id = newNodeId(this.dsl, type);
-    if (source) this.smartDefaults(node, source.node);
+    if (source?.port === ERROR_PORT) {
+      // A fallback for a failed node: its outputs don't exist, so don't show them.
+      if (node.type === 'message') node.params.text = 'Sorry, something went wrong. Please try again.';
+    } else if (source) this.smartDefaults(node, source.node);
     if (insertBefore) setTarget(node, outPorts(node)[0]?.key || 'next', insertBefore);
 
     if (!pos) {
       if (source) {
         const src = this.position(source.node);
         const index = Math.max(0, outPorts(this.dsl.nodes[source.node]).findIndex((p) => p.key === source.port));
-        pos = { x: src.x + 300, y: src.y + index * 80 };
+        pos = source.port === ERROR_PORT ? { x: src.x + 300, y: src.y + 160 } : { x: src.x + 300, y: src.y + index * 80 };
       } else {
         const c = this.canvas.center();
         pos = { x: Math.round(c.x - 120), y: Math.round(c.y - 40) };
@@ -447,7 +450,7 @@ export class EditorPage {
       return true;
     }
     for (const id of missing) {
-      const parent = Object.keys(this.dsl.nodes).find((p) => layout[p] && outPorts(this.dsl.nodes[p]).some((port) => port.target === id));
+      const parent = Object.keys(this.dsl.nodes).find((p) => layout[p] && links(this.dsl.nodes[p]).some((port) => port.target === id));
       const below = Math.max(...Object.values(layout).map((p) => p.y)) + 160;
       layout[id] = this.freeSpot(parent ? { x: layout[parent].x + 300, y: layout[parent].y } : { x: 0, y: below });
     }

@@ -592,3 +592,105 @@ def test_failed_node_is_logged(products, use_llm):
     assert failed[0]["error"] == "RuntimeError: the model is down"
     assert "[1] " in failed[0]["inputs"]["system_prompt"]  # what it was about to send
     assert events[-1] == {"event": "error", "message": "RuntimeError: the model is down"}
+
+
+# --- on_error: where a failed node goes ----------------------------------------------
+
+
+class Down(ScriptedLLM):
+    """A model whose answers fail after `words` streamed words (0: before any text)."""
+
+    def __init__(self, words=0, **kwargs):
+        super().__init__(**kwargs)
+        self.words = words
+
+    def stream(self, system, messages):
+        yield from list(super().stream(system, messages))[: self.words]
+        raise RuntimeError("the model is down")
+
+    def parse(self, system, messages, schema):
+        raise RuntimeError("the model is down")
+
+
+def fallback_workflow(**answer):
+    return make_workflow(
+        {
+            "nodes": {
+                "begin": {"type": "begin", "next": "answer"},
+                "answer": {"type": "llm", "next": "reply", "on_error": "sorry", **answer},
+                "reply": {"type": "message", "params": {"text": "{answer@content}"}, "next": "more"},
+                "more": {"type": "message", "params": {"text": "Anything else?"}},
+                "sorry": {"type": "message", "params": {"text": "Sorry, try again."}, "next": "help"},
+                "help": {"type": "message", "params": {"text": "Call 123."}},
+            }
+        }
+    )
+
+
+def test_failed_node_goes_to_on_error(kb, use_llm):
+    use_llm(Down())
+    events, done = run(fallback_workflow(), "hi")
+    failed = [e for e in events if e["event"] == "node_failed"]
+    assert len(failed) == 1 and failed[0]["node"] == "answer" and failed[0]["next"] == "sorry"
+    assert failed[0]["error"] == "RuntimeError: the model is down"
+    assert done["event"] == "done" and not any(e["event"] == "error" for e in events)
+    assert done["answer"] == "Sorry, try again.\n\nCall 123." == streamed_text(events)
+    ran = [e["node"] for e in events if e["event"] == "node_started"]
+    assert ran == ["begin", "answer", "sorry", "help"]  # not reply/more: the branch of the answer
+
+
+def test_text_streamed_before_a_failure_is_kept(kb, use_llm):
+    use_llm(Down(words=2, reply=lambda s, m: "I am so glad you told me."))
+    events, done = run(fallback_workflow(), "hi")
+    # The user saw "I am " before the failure: the saved answer is what they saw, then the fallback.
+    assert done["answer"] == "I am \n\nSorry, try again.\n\nCall 123." == streamed_text(events)
+
+
+def test_node_with_on_error_goes_to_next_when_it_works(kb, use_llm):
+    use_llm(ScriptedLLM(reply=lambda s, m: "Fine."))
+    events, done = run(fallback_workflow(), "hi")
+    assert done["answer"] == "Fine.\n\nAnything else?" == streamed_text(events)
+    assert not any(e["event"] == "node_failed" for e in events)
+
+
+def test_failed_router_goes_to_on_error(kb, use_llm):
+    use_llm(Down())
+    wf = make_workflow(
+        {
+            "nodes": {
+                "begin": {"type": "begin", "next": "route"},
+                "route": {
+                    "type": "categorize",
+                    "on_error": "sorry",
+                    "params": {"categories": [{"name": "a", "next": "x"}, {"name": "b", "next": "x"}]},
+                },
+                "x": {"type": "message", "params": {"text": "x"}},
+                "sorry": {"type": "message", "params": {"text": "Sorry."}},
+            }
+        }
+    )
+    events, done = run(wf, "hi")
+    assert done["answer"] == "Sorry." and [e["node"] for e in events if e["event"] == "node_failed"] == ["route"]
+
+
+def test_failed_node_without_on_error_still_ends_the_run(kb, use_llm):
+    use_llm(Down())
+    dsl = fallback_workflow().dsl
+    del dsl["nodes"]["answer"]["on_error"]
+    with pytest.raises(RuntimeError, match="the model is down"):
+        run(make_workflow(dsl, name="no-fallback"), "hi")
+
+
+@pytest.mark.parametrize(
+    "target, error",
+    [
+        ("ghost", "on_error: node 'ghost' does not exist"),
+        ("answer", "on_error: a node can't go to itself"),
+        ("begin", "on_error: can't go to the begin node"),
+    ],
+)
+def test_on_error_is_checked(kb, target, error):
+    dsl = template("rag_chat", kb.id)
+    dsl["nodes"]["answer"]["on_error"] = target
+    with pytest.raises(ValueError, match=error):
+        validate_dsl(dsl)

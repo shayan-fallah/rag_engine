@@ -185,7 +185,8 @@ export class TestPanel {
       }
       case 'node_failed': {
         const step = running(event.node);
-        if (step) Object.assign(step, { status: 'failed', ms: event.elapsed_ms, inputs: event.inputs, error: event.error });
+        // next: the node's on_error node, where the run goes on.
+        if (step) Object.assign(step, { status: 'failed', ms: event.elapsed_ms, inputs: event.inputs, error: event.error, next: event.next });
         runState[event.node] = { status: 'failed', error: event.error };
         break;
       }

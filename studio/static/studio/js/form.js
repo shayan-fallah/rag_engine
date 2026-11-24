@@ -2,7 +2,7 @@
 // Every param of the engine shows up here; json_schema_extra hints pick the widget.
 
 import { config } from './api.js';
-import { NODE_ID, ROUTERS, nodeOutputs, outPorts, variablesFor } from './graph.js';
+import { ERROR_PORT, NODE_ID, ROUTERS, links, nodeOutputs, variablesFor } from './graph.js';
 import {
   autoGrow, button, clone, closePopover, deepEqual, formatLoose, h, icon, iconButton,
   insertAtCursor, modal, parseLoose, popover, toast,
@@ -503,6 +503,20 @@ export function renderNodePanel(editor, id) {
       h('div', { class: 'help' }, 'Or drag from the dot on the right of the node to another node.'));
   }
 
+  let onError = null;
+  if (node.type !== 'begin') {
+    const nodes = editor.dsl.nodes;
+    const targets = Object.keys(nodes).filter((n) => n !== id && nodes[n].type !== 'begin');
+    onError = h('div', { class: 'field' },
+      h('div', { class: 'field-label' }, h('label', null, 'If it fails, go to')),
+      h('select', { value: node.on_error ?? '', onChange: (e) => editor.connect(id, ERROR_PORT, e.target.value || null) },
+        h('option', { value: '' }, '— stop the run with an error —'),
+        targets.map((n) => h('option', { value: n }, `${n} (${editor.types[nodes[n].type]?.title || nodes[n].type})`)),
+        node.on_error && !targets.includes(node.on_error) ? h('option', { value: node.on_error }, `${node.on_error} (missing)`) : null),
+      h('div', { class: 'help' }, 'When this node fails (e.g. the model server is down or times out), the run goes to this node '
+        + 'instead of ending with an error, usually a message with a fixed text. Or drag from the dot at the bottom of the node.'));
+  }
+
   return h('div', { class: 'panel' },
     h('div', { class: `panel-head t-${node.type}` },
       h('span', { class: 'node-icon big' }, icon(node.type)),
@@ -513,7 +527,8 @@ export function renderNodePanel(editor, id) {
         h('div', { class: 'field-label' }, h('label', null, 'Node id')),
         idInput,
         h('div', { class: 'help' }, 'Other nodes use its outputs as {id@output}. Renaming updates them.')),
-      next),
+      next,
+      onError),
     section('Settings', renderFields(node.params, info.schema, info.schema, ctx, 'params')),
     section('Outputs', h('div', { class: 'outputs-slot' }, outputList(editor, id))),
     h('div', { class: 'panel-actions' },
@@ -536,7 +551,7 @@ export function outputList(editor, id) {
 
 export function renderEdgePanel(editor, sel) {
   const node = editor.dsl.nodes[sel.node];
-  const port = outPorts(node).find((p) => p.key === sel.port);
+  const port = links(node).find((p) => p.key === sel.port);
   const from = port?.label ? `${sel.node} (${port.label})` : sel.node;
   return h('div', { class: 'panel' },
     h('div', { class: 'panel-head' }, h('div', null, h('div', { class: 'panel-type' }, 'Connection'),

@@ -13,6 +13,9 @@ Text params are templates. Like RAGFlow, {sys.query} is the user's message and
 {node_id@output} is an output of an earlier node. A node without "next" ends the
 run. "categorize" and "switch" nodes pick the next node themselves.
 
+A node with "on_error" goes to that node if it fails (e.g. the model server is down)
+instead of ending the run with an error, usually a message node with a fixed text.
+
 Node types and their outputs are listed in NODE_INFO below. Every param is
 described by its pydantic model; the studio editor builds its forms from them
 (node_types()), so a new param shows up there by itself. json_schema_extra
@@ -39,6 +42,7 @@ from pydantic import (
 )
 
 from knowledge.search import CHUNK_TEMPLATE, FILTER_OPS, check_filter
+from workflows.calculator import DESCRIPTION as CALCULATOR_DESCRIPTION
 
 SYS_VAR_INFO = {
     "query": "The user's message",
@@ -399,9 +403,24 @@ class SearchTool(Params):
         return fields
 
 
+CALCULATOR_TOOL = "calculate"
+
+
 class AgentParams(LLMParams):
     tools: list[SearchTool] = Field(
-        min_length=1, title="Search tools", description="Searches the model can call, as often as it needs"
+        default_factory=list, title="Search tools", description="Searches the model can call, as often as it needs"
+    )
+    calculator: bool = Field(
+        False,
+        title="Calculator tool",
+        description=f"Gives the model a {CALCULATOR_TOOL} tool: it sends expressions (every step of a long "
+        "multiplication, fractions, percents) and copies exact results, instead of writing digits that only look right.",
+    )
+    calculator_description: str = Field(
+        CALCULATOR_DESCRIPTION,
+        title="Calculator description",
+        description="Tells the model when and how to use the calculator",
+        json_schema_extra=ui("textarea", group="advanced", hide_when={"calculator": "empty"}),
     )
     max_rounds: int = Field(
         4,
@@ -418,6 +437,14 @@ class AgentParams(LLMParams):
         if len(names) != len(set(names)):
             raise ValueError("tool names must be unique")
         return tools
+
+    @model_validator(mode="after")
+    def has_a_tool(self):
+        if not self.tools and not self.calculator:
+            raise ValueError("add a search tool or turn on the calculator")
+        if self.calculator and any(t.name == CALCULATOR_TOOL for t in self.tools):
+            raise ValueError(f"a search tool can't be called {CALCULATOR_TOOL!r} when the calculator is on")
+        return self
 
 
 class Category(Params):
@@ -529,8 +556,8 @@ NODE_INFO: dict[str, dict] = {
     },
     "agent": {
         "title": "Agent",
-        "description": "A chat model with search tools: it decides what to search (by query, by metadata, or both), "
-        "can search several times, then answers.",
+        "description": "A chat model with tools: it decides what to search (by query, by metadata, or both), "
+        "can search several times, and can use an exact calculator, then answers.",
         "outputs": {"content": "The model's answer"},
         "starter": {
             "system_prompt": "Use the search tool to find information before you answer, and cite the numbers of "
@@ -584,6 +611,7 @@ class Node(BaseModel):
     type: Literal["begin", "retrieval", "llm", "agent", "categorize", "switch", "message"]
     params: dict = Field(default_factory=dict)
     next: str | None = None
+    on_error: str | None = None  # where to go if the node fails, instead of ending the run with an error
     _parsed: Any = PrivateAttr(None)  # typed params, set by validate_dsl
 
     @property
@@ -650,6 +678,13 @@ def validate_dsl(dsl: dict, check_db: bool = True) -> WorkflowSpec:
         for target in node.targets():
             if target is not None and target not in spec.nodes:
                 errors.append((node_id, f"next node {target!r} does not exist"))
+        if node.on_error is not None:
+            if node.on_error not in spec.nodes:
+                errors.append((node_id, f"on_error: node {node.on_error!r} does not exist"))
+            elif node.on_error == node_id:
+                errors.append((node_id, "on_error: a node can't go to itself when it fails"))
+            elif spec.nodes[node.on_error].type == "begin":
+                errors.append((node_id, "on_error: can't go to the begin node"))
         for ref in _references(node.params):
             if ref.startswith("sys."):
                 if ref[4:] not in SYS_VARS:

@@ -18,6 +18,19 @@ export function outPorts(node) {
   return [{ key: 'next', label: '', target: node.next ?? null }];
 }
 
+// Where a node goes if it fails (on_error): a port of its own, drawn apart from the ports above.
+export const ERROR_PORT = 'on_error';
+
+export function errorPort(node) {
+  return node.type === 'begin' ? null : { key: ERROR_PORT, label: 'on error', target: node.on_error ?? null, error: true };
+}
+
+// Every connection of a node: its output ports and its on_error port.
+export function links(node) {
+  const port = errorPort(node);
+  return port ? [...outPorts(node), port] : outPorts(node);
+}
+
 export function caseLabel(c, i) {
   const conds = c.conditions || [];
   if (!conds.length) return `case ${i + 1}`;
@@ -30,6 +43,10 @@ export function caseLabel(c, i) {
 
 export function setTarget(node, key, target) {
   target = target || null;
+  if (key === ERROR_PORT) {
+    if (target) node.on_error = target; else delete node.on_error;
+    return;
+  }
   if (key === 'next') {
     if (target) node.next = target; else delete node.next;
     return;
@@ -46,7 +63,7 @@ export function setTarget(node, key, target) {
 }
 
 export function clearTargets(node) {
-  for (const port of outPorts(node)) setTarget(node, port.key, null);
+  for (const port of links(node)) setTarget(node, port.key, null);
 }
 
 export function newNodeId(dsl, base) {
@@ -79,7 +96,7 @@ export function renameNode(dsl, oldId, newId) {
   }
   const pattern = new RegExp(`\\{${escapeRe(oldId)}@`, 'g');
   for (const node of Object.values(dsl.nodes)) {
-    for (const port of outPorts(node)) if (port.target === oldId) setTarget(node, port.key, newId);
+    for (const port of links(node)) if (port.target === oldId) setTarget(node, port.key, newId);
     if (node.params) rewriteStrings(node.params, (s) => s.replace(pattern, `{${newId}@`));
   }
 }
@@ -88,15 +105,15 @@ export function removeNode(dsl, id) {
   delete dsl.nodes[id];
   if (dsl.layout) delete dsl.layout[id];
   for (const node of Object.values(dsl.nodes)) {
-    for (const port of outPorts(node)) if (port.target === id) setTarget(node, port.key, null);
+    for (const port of links(node)) if (port.target === id) setTarget(node, port.key, null);
   }
 }
 
 export function edges(dsl) {
   const list = [];
   for (const [id, node] of Object.entries(dsl.nodes)) {
-    for (const port of outPorts(node)) {
-      if (port.target && dsl.nodes[port.target]) list.push({ from: id, port: port.key, to: port.target });
+    for (const port of links(node)) {
+      if (port.target && dsl.nodes[port.target]) list.push({ from: id, port: port.key, to: port.target, error: !!port.error });
     }
   }
   return list;
@@ -133,7 +150,7 @@ export function autoLayout(dsl, sizes = {}) {
     while (queue.length) {
       const id = queue.shift();
       order.push(id);
-      for (const port of outPorts(dsl.nodes[id])) {
+      for (const port of links(dsl.nodes[id])) {
         const t = port.target;
         if (t && dsl.nodes[t] && depth[t] === undefined) {
           depth[t] = depth[id] + 1;

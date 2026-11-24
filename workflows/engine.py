@@ -1,7 +1,8 @@
 """Run a workflow with LangGraph.
 
 Each node becomes a LangGraph node, "next" becomes an edge, and categorize/switch
-nodes become conditional edges. The run state is:
+nodes become conditional edges, as do nodes with "on_error" (where a failed node goes
+instead of ending the run). The run state is:
 
     sys         {query, user_id, conversation_id, date, history, turns}
     inputs      values for the begin node, from the request
@@ -13,8 +14,10 @@ nodes become conditional edges. The run state is:
 run_workflow() yields events as dicts:
     node_started   {node, type}
     node_finished  {node, type, elapsed_ms, outputs, next}     (+ inputs when debug)
-    node_failed    {node, type, elapsed_ms, error}             (+ inputs when debug)
+    node_failed    {node, type, elapsed_ms, error, next?}      (+ inputs when debug; next: its on_error node,
+                                                                   where the run goes on, else the run ends with error)
     tool_call      {node, tool, arguments, query, results, elapsed_ms, error?}   (agent nodes; + result when debug)
+                   calculator: {node, tool: "calculate", kind: "calculator", arguments, results, elapsed_ms, error?}
     message        {delta}                         (answer text, as it is written)
     done           {answer, references}           (references[].cited: the answer cites it as [n])
 
@@ -76,11 +79,15 @@ def build_graph(spec: WorkflowSpec):
 
     graph.add_edge(START, spec.begin_id)
     for node_id, node in spec.nodes.items():
-        if node.type in ("categorize", "switch"):
-            targets = {t or END for t in node.targets()}
+        router = node.type in ("categorize", "switch")
+        if router or node.on_error:
+            # Routers and failed nodes put their next node in the outputs as "_next".
+            targets = {t or END for t in [*node.targets(), node.on_error]}
             graph.add_conditional_edges(
                 node_id,
-                lambda state, nid=node_id: state["outputs"][nid]["_next"] or END,
+                lambda state, nid=node_id, default=None if router else node.next: (
+                    state["outputs"][nid].get("_next", default) or END
+                ),
                 {t: t for t in targets},
             )
         else:
